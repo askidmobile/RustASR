@@ -1,0 +1,27 @@
+[package]
+name = "model-whisper"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Whisper ASR model implementation for RustASR (via candle-transformers)"
+
+[dependencies]
+asr-core.workspace = true
+audio.workspace = true
+candle-core.workspace = true
+candle-nn.workspace = true
+candle-transformers.workspace = true
+safetensors.workspace = true
+tokenizers.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+byteorder.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+hound.workspace = true

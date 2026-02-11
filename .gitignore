@@ -1,0 +1,33 @@
+# Build artifacts
+/target/
+*.lock
+
+# Models (too large for git)
+/models/
+
+# Audio files
+*.wav
+*.mp3
+*.flac
+
+# Logs
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Python virtual environments
+.venv/
+__pycache__/
+*.pyc
+.ruff_cache/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test outputs
+*.npy
+reference_*.bin const.rs

@@ -1,0 +1,236 @@
+[
+  {
+    "idx": 0,
+    "speaker": "mic",
+    "start_s": 0.48,
+    "end_s": 2.13,
+    "language": "Russian",
+    "text": "Преть леш.",
+    "stop_reason": "eos"
+  },
+  {
+    "idx": 1,
+    "speaker": "system",
+    "start_s": 1.11,
+    "end_s": 2.7,
+    "language": "Russian",
+    "text": "Алло, алло.",
+    "stop_reason": "eos"
+  },
+  {
+    "idx": 2,
+    "speaker": "mic",
+    "start_s": 3.18,
+    "end_s": 5.25,
+    "language": "Russian",
+    "text": "Привет.",
+    "stop_reason": "eos"
+  },
+  {
+    "idx": 3,
+    "speaker": "system",
+    "start_s": 3.54,
+    "end_s": 4.35,
+    "language": "Russian",
+    "text": "Читаем.",
+    "stop_reason": "eos"
+  },
+  {
+    "idx": 4,
+    "speaker": "system",
+    "start_s": 5.52,
+    "end_s": 8.31,
+    "language": "Russian",
+    "text": "тык меня слышишь",
+    "stop_reason": "eos"
+  },
+  {
+    "idx": 5,
+    "speaker": "mic",
+    "start_s": 5.94,
+    "end_s": 11.07,
+    "language": "Russian",
+    "text": "Привет, привет. Сижу с тобой разговариваю, выключил микрофона.",
+    "stop_reason": "eos"
+  },
+  {
+    "idx": 6,
+    "speaker": "system",
+    "start_s": 9.09,
+    "end_s": 9.99,
+    "language": "Russian",
+    "text": "да",
+    "stop_reason": "eos"
+  },
+  {
+    "idx": 7,
+    "speaker": "system",
+    "start_s": 12.39,
+    "end_s": 17.37,
+    "language": "Russian",
+    "text": "бывает Да вышло недопонимание я тебя на должностную бежал от ели",
+    "stop_reason": "eos"
+  },
+  {
+    "idx": 8,
+    "speaker": "mic",
+    "start_s": 13.53,
+    "end_s": 14.16,
+    "language": "Russian",
+    "text": "Да.",
+    "stop_reason": "eos"
+  },
+  {
+    "idx": 9,
+    "speaker": "mic",
+    "start_s": 14.22,
+    "end_s": 15.06,
+    "language": "Russian",
+    "text": "Да.",
+    "stop_reason": "eos"
+  },
+  {
+    "idx": 10,
+    "speaker": "mic",
+    "start_s": 17.04,
+    "end_s": 19.92,
+    "language": "Russian",
+    "text": "Да.",
+    "stop_reason": "eos"
+  },
+  {
+    "idx": 11,
+    "speaker": "system",
+    "start_s": 17.61,
+    "end_s": 19.95,
+    "language": "Russian",
+    "text": "К сожалению, ну.",
+    "stop_reason": "eos"
+  },
+  {
+    "idx": 12,
+    "speaker": "system",
+    "start_s": 20.19,
+    "end_s": 22.17,
+    "language": "Russian",
+    "text": "я говорю, не чувствует пальцем, что делал.",
+    "stop_reason": "eos"
+  },
+  {
+    "idx": 13,
+    "speaker": "mic",
+    "start_s": 20.37,
+    "end_s": 49.77,
+    "language": "Russian",
+    "text": "Да я пришел, сижу, сижу, жду, думаю опаздывать человек, ну бывает, сижу, сижу, думаю, нет, а пойти, чем позаниматься, телегу открывать, давать разрешение, ну, тоже ничего, даже нормально, бывает. Ладно, давай к нашим баранам, что там, вообще, я, я уже, я не помню, мы с тобой перед новым годом по этой фигне разговаривали, я, честно сказать уже.",
+    "stop_reason": "eos"
+  },
+  {
+    "idx": 14,
+    "speaker": "system",
+    "start_s": 26.55,
+    "end_s": 27.15,
+    "language": "Russian",
+    "text": "да.",
+    "stop_reason": "eos"
+  },
+  {
+    "idx": 15,
+    "speaker": "system",
+    "start_s": 28.29,
+    "end_s": 28.89,
+    "language": "Russian",
+    "text": "Да.",
+    "stop_reason": "eos"
+  },
+  {
+    "idx": 16,
+    "speaker": "system",
+    "start_s": 30.06,
+    "end_s": 31.29,
+    "language": "Russian",
+    "text": "Да.",
+    "stop_reason": "eos"
+  },
+  {
+    "idx": 17,
+    "speaker": "system",
+    "start_s": 33.66,
+    "end_s": 34.56,
+    "language": "Russian",
+    "text": "Да.",
+    "stop_reason": "eos"
+  },
+  {
+    "idx": 18,
+    "speaker": "system",
+    "start_s": 34.62,
+    "end_s": 35.55,
+    "language": "Russian",
+    "text": "да.",
+    "stop_reason": "eos"
+  },
+  {
+    "idx": 19,
+    "speaker": "system",
+    "start_s": 36.87,
+    "end_s": 38.43,
+    "language": "Russian",
+    "text": "Да.",
+    "stop_reason": "eos"
+  },
+  {
+    "idx": 20,
+    "speaker": "system",
+    "start_s": 38.73,
+    "end_s": 40.44,
+    "language": "Russian",
+    "text": "Да, скажи.",
+    "stop_reason": "eos"
+  },
+  {
+    "idx": 21,
+    "speaker": "system",
+    "start_s": 48.54,
+    "end_s": 49.86,
+    "language": "Russian",
+    "text": "Ммм.",
+    "stop_reason": "eos"
+  },
+  {
+    "idx": 22,
+    "speaker": "system",
+    "start_s": 50.52,
+    "end_s": 60.0,
+    "language": "Russian",
+    "text": "Ну я ставил, потому что ты там поставил сам себе сколько исполнения 20 января, собственно.",
+    "stop_reason": "eos"
+  },
+  {
+    "idx": 23,
+    "speaker": "mic",
+    "start_s": 50.97,
+    "end_s": 52.71,
+    "language": "Russian",
+    "text": "как-то",
+    "stop_reason": "eos"
+  },
+  {
+    "idx": 24,
+    "speaker": "mic",
+    "start_s": 55.59,
+    "end_s": 57.09,
+    "language": "Russian",
+    "text": "Да.",
+    "stop_reason": "eos"
+  },
+  {
+    "idx": 25,
+    "speaker": "mic",
+    "start_s": 57.87,
+    "end_s": 60.0,
+    "language": "Russian",
+    "text": "А.",
+    "stop_reason": "eos"
+  }
+]

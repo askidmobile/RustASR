@@ -1,0 +1,98 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/asr-core",
+    "crates/audio",
+    "crates/aut-encoder",
+    "crates/qwen3-decoder",
+    "crates/asr-pipeline",
+    "crates/asr-cli",
+    "crates/model-whisper",
+    "crates/model-gigaam",
+    "crates/model-parakeet",
+    "crates/model-qwen3",
+    "crates/asr-engine",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["RustASR Team"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/example/rustasr"
+keywords = ["asr", "speech-recognition", "qwen", "audio", "machine-learning"]
+categories = ["multimedia::audio", "science::machine-learning"]
+
+[workspace.dependencies]
+# Core crates (internal)
+asr-core = { path = "crates/asr-core" }
+audio = { path = "crates/audio" }
+aut-encoder = { path = "crates/aut-encoder" }
+qwen3-decoder = { path = "crates/qwen3-decoder" }
+model-whisper = { path = "crates/model-whisper" }
+model-gigaam = { path = "crates/model-gigaam" }
+model-parakeet = { path = "crates/model-parakeet" }
+model-qwen3 = { path = "crates/model-qwen3" }
+asr-engine = { path = "crates/asr-engine" }
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Async runtime
+tokio = { version = "1.43", features = ["full"] }
+futures = "0.3"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Logging and metrics
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+# ML / Tensor backend
+candle-core = { version = "0.8", features = ["metal"] }
+candle-nn = { version = "0.8", features = ["metal"] }
+candle-transformers = { version = "0.8", features = ["metal"] }
+safetensors = "0.5"
+
+# Tokenization
+tokenizers = "0.21"
+
+# Audio processing
+hound = "3.5"           # WAV I/O
+rubato = "0.16"         # Resampling
+rustfft = "6.2"         # FFT for spectrogram
+webrtc-vad = "0.4"      # VAD (WebRTC)
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+indicatif = "0.17"      # Progress bars
+
+# Testing & Benchmarking
+criterion = { version = "0.5", features = ["html_reports"] }
+
+# Utilities
+byteorder = "1.5"
+parking_lot = "0.12"
+rand = "0.8"
+once_cell = "1.20"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+strip = "symbols"
+
+[profile.bench]
+inherits = "release"
+debug = true
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

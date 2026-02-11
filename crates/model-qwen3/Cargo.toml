@@ -1,0 +1,20 @@
+[package]
+name = "model-qwen3"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Qwen3-ASR модель: AuT encoder + Qwen3 LLM decoder (обёртка для ASR Engine)"
+
+[dependencies]
+asr-core.workspace = true
+asr-pipeline = { path = "../asr-pipeline" }
+candle-core.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+hound.workspace = true

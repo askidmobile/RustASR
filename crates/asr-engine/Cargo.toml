@@ -1,0 +1,33 @@
+[package]
+name = "asr-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Единый фасад для всех ASR-моделей RustASR (Whisper, GigaAM, Parakeet, Qwen3)"
+
+[features]
+default = ["whisper", "gigaam", "parakeet", "qwen3"]
+whisper = ["dep:model-whisper"]
+gigaam = ["dep:model-gigaam"]
+parakeet = ["dep:model-parakeet"]
+qwen3 = ["dep:model-qwen3"]
+all-models = ["whisper", "gigaam", "parakeet", "qwen3"]
+
+[dependencies]
+asr-core.workspace = true
+audio.workspace = true
+candle-core.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+
+# Модельные крейты (за feature gates)
+model-whisper = { workspace = true, optional = true }
+model-gigaam = { workspace = true, optional = true }
+model-parakeet = { workspace = true, optional = true }
+model-qwen3 = { workspace = true, optional = true }
+
+[dev-dependencies]
+hound.workspace = true

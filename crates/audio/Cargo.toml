@@ -1,0 +1,16 @@
+[package]
+name = "audio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+asr-core.workspace = true
+candle-core.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+hound.workspace = true
+rubato.workspace = true
+rustfft.workspace = true

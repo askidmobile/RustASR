@@ -1,0 +1,20 @@
+[package]
+name = "asr-pipeline"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+anyhow.workspace = true
+candle-core.workspace = true
+candle-nn.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Internal crates
+asr-core = { path = "../asr-core" }
+audio = { path = "../audio" }
+aut-encoder = { path = "../aut-encoder" }
+qwen3-decoder = { path = "../qwen3-decoder" }
