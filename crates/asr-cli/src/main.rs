@@ -32,6 +32,17 @@ struct Cli {
     command: Commands,
 }
 
+impl ModelTypeArg {
+    fn to_model_type(self) -> asr_core::ModelType {
+        match self {
+            ModelTypeArg::Qwen3 => asr_core::ModelType::Qwen3Asr,
+            ModelTypeArg::Whisper => asr_core::ModelType::Whisper,
+            ModelTypeArg::Gigaam => asr_core::ModelType::GigaAm,
+            ModelTypeArg::Parakeet => asr_core::ModelType::Parakeet,
+        }
+    }
+}
+
 #[derive(ValueEnum, Debug, Clone, Copy)]
 enum DecoderWeightsArg {
     Auto,
@@ -124,6 +135,10 @@ enum Commands {
         /// Path to the model directory
         #[arg(long)]
         model: PathBuf,
+
+        /// Тип модели: qwen3 (по умолчанию) или whisper/gigaam/parakeet
+        #[arg(long, value_enum, default_value = "qwen3")]
+        model_type: ModelTypeArg,
 
         /// Path to the audio file (WAV format)
         #[arg(long)]
@@ -324,7 +339,7 @@ fn main() -> Result<()> {
                 ModelTypeArg::Whisper => {
                     run_transcribe_whisper(
                         &model, &resampled.samples, &device, language.as_deref(),
-                        max_tokens, out_text, start,
+                        max_tokens, out_text, start, &decoder_weights,
                     )?;
                 }
                 ModelTypeArg::Gigaam => {
@@ -372,6 +387,7 @@ fn main() -> Result<()> {
 
         Commands::Diarize {
             model,
+            model_type,
             audio,
             device,
             decoder_weights,
@@ -396,6 +412,7 @@ fn main() -> Result<()> {
         } => {
             run_diarize(
                 model,
+                model_type,
                 audio,
                 &device,
                 decoder_weights,
@@ -452,13 +469,23 @@ fn run_transcribe_whisper(
     max_tokens: Option<usize>,
     out_text: Option<PathBuf>,
     start: Instant,
+    decoder_weights: &DecoderWeightsArg,
 ) -> Result<()> {
-    println!("🧠 Loading Whisper model...");
-    let mut engine = asr_engine::AsrEngine::load(
-        asr_core::ModelType::Whisper,
-        model_dir,
-        device,
-    )?;
+    let quantized = matches!(decoder_weights, DecoderWeightsArg::Gguf);
+    println!("🧠 Loading Whisper model{}...", if quantized { " (GGUF quantized)" } else { "" });
+    let mut engine = if quantized {
+        asr_engine::AsrEngine::load_quantized(
+            asr_core::ModelType::Whisper,
+            model_dir,
+            device,
+        )?
+    } else {
+        asr_engine::AsrEngine::load(
+            asr_core::ModelType::Whisper,
+            model_dir,
+            device,
+        )?
+    };
     let info = engine.model_info();
     println!("   Model: {}", engine.name());
     println!(
@@ -1106,6 +1133,7 @@ fn extract_channel(buf: &asr_core::AudioBuffer, idx: usize) -> Result<asr_core::
 
 fn run_diarize(
     model: PathBuf,
+    model_type: ModelTypeArg,
     audio_path: PathBuf,
     device_arg: &str,
     decoder_weights: DecoderWeightsArg,
@@ -1129,7 +1157,6 @@ fn run_diarize(
     out_dir: Option<PathBuf>,
 ) -> Result<()> {
     use anyhow::Context;
-    use asr_pipeline::StopReason;
     use serde::Serialize;
 
     #[derive(Debug, Clone, Serialize)]
@@ -1151,15 +1178,89 @@ fn run_diarize(
         end: usize,
     }
 
+    /// Абстракция транскрибатора: Qwen3 (AsrPipeline) или любая другая модель (AsrEngine).
+    enum Transcriber {
+        Qwen3(asr_pipeline::AsrPipeline),
+        Engine(asr_engine::AsrEngine),
+    }
+
+    struct SegmentResult {
+        text: String,
+        language: String,
+        stop_reason: String,
+    }
+
+    impl Transcriber {
+        fn transcribe_segment(
+            &mut self,
+            samples: &[f32],
+            max_tokens: Option<usize>,
+            language: Option<&str>,
+            dur_s: f32,
+        ) -> Result<SegmentResult> {
+            match self {
+                Transcriber::Qwen3(pipeline) => {
+                    let mt = max_tokens.unwrap_or_else(|| estimate_max_tokens_for_segment(dur_s));
+                    let r = pipeline.transcribe_to_result_with_max_tokens_and_language(
+                        samples,
+                        mt,
+                        language,
+                    )?;
+                    let stop = match r.stop_reason {
+                        asr_pipeline::StopReason::Eos => "eos",
+                        asr_pipeline::StopReason::MaxTokens => "max_tokens",
+                        asr_pipeline::StopReason::Repetition => "repetition",
+                    };
+                    Ok(SegmentResult {
+                        text: r.text.trim().to_string(),
+                        language: r.language.trim().to_string(),
+                        stop_reason: stop.to_string(),
+                    })
+                }
+                Transcriber::Engine(engine) => {
+                    let mut options = asr_core::TranscribeOptions::default();
+                    if let Some(lang) = language {
+                        options = options.with_language(lang);
+                    }
+                    if let Some(mt) = max_tokens {
+                        options = options.with_max_tokens(mt);
+                    }
+                    let r = engine.transcribe(samples, &options)?;
+                    Ok(SegmentResult {
+                        text: r.text.trim().to_string(),
+                        language: r.language.unwrap_or_default(),
+                        stop_reason: "eos".to_string(),
+                    })
+                }
+            }
+        }
+    }
+
     const TARGET_SR: usize = 16000;
 
     let device = create_device(device_arg)?;
-    let pipeline = asr_pipeline::AsrPipeline::from_model_dir_with_decoder_weights_and_gguf(
-        &model,
-        &device,
-        decoder_weights.into(),
-        decoder_gguf.clone(),
-    )?;
+
+    // Создаём транскрибатор в зависимости от типа модели.
+    let mut transcriber = match model_type {
+        ModelTypeArg::Qwen3 => {
+            let pipeline = asr_pipeline::AsrPipeline::from_model_dir_with_decoder_weights_and_gguf(
+                &model,
+                &device,
+                decoder_weights.into(),
+                decoder_gguf.clone(),
+            )?;
+            Transcriber::Qwen3(pipeline)
+        }
+        _ => {
+            let quantized = matches!(decoder_weights, DecoderWeightsArg::Gguf);
+            let engine = if quantized {
+                asr_engine::AsrEngine::load_quantized(model_type.to_model_type(), &model, &device)?
+            } else {
+                asr_engine::AsrEngine::load(model_type.to_model_type(), &model, &device)?
+            };
+            Transcriber::Engine(engine)
+        }
+    };
 
     let start_all = Instant::now();
 
@@ -1170,6 +1271,7 @@ fn run_diarize(
     println!("🎧 Diarize + VAD transcription");
     println!("================================");
     println!("Model: {}", model.display());
+    println!("Model type: {:?}", model_type);
     println!("Audio: {}", audio_path.display());
     println!(
         "Audio: {} Hz, channels={}, duration={:.2}s",
@@ -1491,7 +1593,6 @@ fn run_diarize(
         let end_s = e as f32 / TARGET_SR as f32;
         let dur_s = (e - s) as f32 / TARGET_SR as f32;
 
-        let mt = max_tokens.unwrap_or_else(|| estimate_max_tokens_for_segment(dur_s));
         let forced_lang = speaker_language_overrides
             .get(&seg.speaker)
             .map(|s| s.as_str())
@@ -1504,53 +1605,42 @@ fn run_diarize(
                     .map(|s| s.as_str())
             })
             .or(language.as_deref());
-        let r = pipeline.transcribe_to_result_with_max_tokens_and_language(
+        let r = transcriber.transcribe_segment(
             seg_samples,
-            mt,
+            max_tokens,
             forced_lang,
+            dur_s,
         )?;
-        let text = r.text.trim().to_string();
-        let lang = r.language.trim().to_string();
-
-        let stop_reason = match r.stop_reason {
-            StopReason::Eos => "eos",
-            StopReason::MaxTokens => "max_tokens",
-            StopReason::Repetition => "repetition",
-        };
 
         let ts0 = vad::format_hhmmss_millis(start_s);
         let ts1 = vad::format_hhmmss_millis(end_s);
 
-        combined_lines.push(format!("[{ts0} - {ts1}] {}: {}", seg.speaker, text));
+        combined_lines.push(format!("[{ts0} - {ts1}] {}: {}", seg.speaker, r.text));
         per_speaker
             .entry(seg.speaker.clone())
             .or_default()
-            .push_str(&format!("{text}\n"));
+            .push_str(&format!("{}\n", r.text));
 
         json_segments.push(JsonSegment {
             idx,
             speaker: seg.speaker.clone(),
             start_s,
             end_s,
-            language: lang,
-            text,
-            stop_reason: stop_reason.to_string(),
+            language: r.language,
+            text: r.text,
+            stop_reason: r.stop_reason.clone(),
         });
 
-        match r.stop_reason {
-            StopReason::MaxTokens => {
-                eprintln!(
-                    "⚠️  segment idx={} speaker={} reached max_tokens={} ({}-{})",
-                    idx, seg.speaker, mt, ts0, ts1
-                );
-            }
-            StopReason::Repetition => {
-                eprintln!(
-                    "⚠️  segment idx={} speaker={} stopped by repetition heuristic ({}-{})",
-                    idx, seg.speaker, ts0, ts1
-                );
-            }
-            _ => {}
+        if r.stop_reason == "max_tokens" {
+            eprintln!(
+                "⚠️  segment idx={} speaker={} reached max_tokens ({}-{})",
+                idx, seg.speaker, ts0, ts1
+            );
+        } else if r.stop_reason == "repetition" {
+            eprintln!(
+                "⚠️  segment idx={} speaker={} stopped by repetition heuristic ({}-{})",
+                idx, seg.speaker, ts0, ts1
+            );
         }
     }
 

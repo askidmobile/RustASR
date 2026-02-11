@@ -1,0 +1,56 @@
+[
+  {
+    "idx": 0,
+    "speaker": "spk0",
+    "start_s": 0.12,
+    "end_s": 2.16,
+    "language": "",
+    "text": "",
+    "stop_reason": "eos"
+  },
+  {
+    "idx": 1,
+    "speaker": "spk0",
+    "start_s": 2.25,
+    "end_s": 32.25,
+    "language": "",
+    "text": "",
+    "stop_reason": "eos"
+  },
+  {
+    "idx": 2,
+    "speaker": "spk0",
+    "start_s": 32.25,
+    "end_s": 33.9,
+    "language": "",
+    "text": "Работа и есть на ждем.",
+    "stop_reason": "eos"
+  },
+  {
+    "idx": 3,
+    "speaker": "spk0",
+    "start_s": 34.05,
+    "end_s": 46.68,
+    "language": "",
+    "text": "Примерно этих типов обслуживание как сделано для можно ли мы используем, тоже самое справочник или нет, и определиться, как из этих сценарий потребуется на тренинг.",
+    "stop_reason": "eos"
+  },
+  {
+    "idx": 4,
+    "speaker": "spk1",
+    "start_s": 46.86,
+    "end_s": 55.59,
+    "language": "",
+    "text": "",
+    "stop_reason": "eos"
+  },
+  {
+    "idx": 5,
+    "speaker": "spk1",
+    "start_s": 56.07,
+    "end_s": 60.0,
+    "language": "",
+    "text": "",
+    "stop_reason": "eos"
+  }
+]

@@ -161,10 +161,14 @@ rustasr transcribe \
 
 ### `diarize` — диаризация + транскрибация
 
+Работает с **любой** моделью (Qwen3, Whisper, GigaAM, Parakeet).
+
 ```bash
 rustasr diarize \
     --model <путь> \
+    --model-type <qwen3|whisper|gigaam|parakeet> \
     --audio <файл.wav> \
+    --device <cpu|metal|cuda> \
     --speaker-mode <auto|channel|cluster> \
     --num-speakers 2 \
     --out-dir output/
@@ -301,6 +305,32 @@ qwen3   = ["dep:model-qwen3"]
 | Cold Start | < 5 секунд | Любая |
 | Peak Memory | < 2 GB | 0.6B модели |
 | Peak Memory | < 3 GB | 1.7B модели |
+
+---
+
+## Результаты тестирования
+
+> Подробный сравнительный тест: [docs/tests/SUMMARY.md](docs/tests/SUMMARY.md)
+
+### Производительность на Metal GPU (60 с русской речи)
+
+| Модель | RTF | Transcribe | Peak RSS | Качество (рус.) |
+|--------|-----|------------|----------|-----------------|
+| **GigaAM v3 CTC** | **0.017** | 1.02 с | 1 719 МБ | ★★★★☆ |
+| **Parakeet TDT v3** | 0.038 | 2.30 с | 4 672 МБ | ★☆☆☆☆ |
+| **Whisper v3 Turbo** | 0.110 | 6.60 с | 1 711 МБ | ★★★★★ |
+| **Qwen3-ASR 0.6B** | 0.114 | 6.84 с | 1 932 МБ | ★★★☆☆ |
+
+### Рекомендации
+
+| Сценарий | Модель |
+|----------|--------|
+| Русский, лучшее качество | Whisper v3 Turbo |
+| Русский, макс. скорость | GigaAM v3 CTC (Metal) |
+| Мультиязычный контент | Whisper v3 Turbo |
+| VAD/диаризация | Любая (`--model-type`) |
+
+Также доступны [результаты квантизации GGUF](docs/tests/quantization.md) (Qwen3, Whisper).
 
 ---
 
