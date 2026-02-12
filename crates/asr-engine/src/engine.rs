@@ -84,6 +84,12 @@ impl AsrEngine {
                         "GigaAM: квантизированные модели пока не поддерживаются.".into(),
                     ));
                 }
+                // Metal safety: проверяем работоспособность GPU перед загрузкой
+                // тяжёлой модели. Краш в AGXMetalG16X::fillBuffer на M4/macOS 26.x
+                // происходит при определённых паттернах буферного пула.
+                if device.is_metal() {
+                    asr_core::metal_utils::metal_probe(device)?;
+                }
                 Box::new(model_gigaam::GigaAmModel::load(model_dir, device)?)
             }
 

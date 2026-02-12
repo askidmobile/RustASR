@@ -29,6 +29,10 @@ pub enum AsrError {
     #[error("Tensor error: {0}")]
     Candle(#[from] candle_core::Error),
 
+    /// Device/GPU errors (Metal, CUDA).
+    #[error("Device error: {0}")]
+    Device(String),
+
     /// JSON parsing errors.
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),

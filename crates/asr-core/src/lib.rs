@@ -14,6 +14,7 @@
 pub mod config;
 pub mod debug;
 pub mod error;
+pub mod metal_utils;
 pub mod model_files;
 pub mod model_registry;
 pub mod traits;

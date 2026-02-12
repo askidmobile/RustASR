@@ -12,6 +12,7 @@ use tracing::{debug, info};
 use asr_core::{
     AsrError, AsrModel, AsrResult, ModelInfo, ModelType, QuantizationType,
     Segment, TranscribeOptions, TranscriptionResult,
+    metal_utils,
 };
 
 use crate::config::GigaAmConfig;
@@ -288,12 +289,20 @@ impl AsrModel for GigaAmModel {
 impl GigaAmModel {
     /// Транскрибировать один чанк аудио.
     fn transcribe_chunk(&self, samples: &[f32]) -> AsrResult<String> {
-        // 1. Mel-спектрограмма
+        // 1. Mel-спектрограмма (CPU via rustfft → загрузка на device)
         let mel = self.mel_extractor.extract(samples, &self.device)?;
         let mel = mel.to_dtype(DType::F32)?;
 
+        // Metal sync: ждём завершения загрузки данных на GPU.
+        // Предотвращает конфликт буферов при агрессивном переиспользовании
+        // в Metal command buffer pool (workaround для AGXMetalG16X fillBuffer bug).
+        metal_utils::metal_sync(&self.device)?;
+
         // 2. Encoder
         let encoded = self.encoder.forward(&mel)?;
+
+        // Metal sync: ждём завершения encoder'а перед CTC head.
+        metal_utils::metal_sync(&self.device)?;
 
         // 3. CTC head → log_probs
         let log_probs = self.head.forward(&encoded)?;

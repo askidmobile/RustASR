@@ -539,9 +539,23 @@ impl ConformerEncoder {
 
         // 3. Прогоняем через все слои Conformer.
         // Маску не используем (batch_size=1 при инференсе).
+        //
+        // Metal workaround: каждые SYNC_EVERY слоёв вставляем device.synchronize()
+        // для сброса Metal command buffer pool. Это предотвращает накопление
+        // слишком большого количества буферов в in-flight состоянии, что может
+        // вызвать краш AGXMetalG16X::fillBuffer на M4 / macOS 26.x.
+        const SYNC_EVERY: usize = 4;
+        let is_metal = x.device().is_metal();
+
         let mut h = x;
-        for layer in &self.layers {
+        for (i, layer) in self.layers.iter().enumerate() {
             h = layer.forward(&h, &cos_emb, &sin_emb, None)?;
+
+            if is_metal && (i + 1) % SYNC_EVERY == 0 {
+                h.device().synchronize().map_err(|e| {
+                    candle_core::Error::Msg(format!("Metal sync at layer {}: {e}", i + 1))
+                })?;
+            }
         }
 
         // 4. Выход: (batch, seq/4, d_model) → (batch, d_model, seq/4)

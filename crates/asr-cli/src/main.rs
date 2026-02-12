@@ -1758,6 +1758,10 @@ fn run_diarize(
 fn create_device(device: &str) -> Result<candle_core::Device> {
     match device {
         "metal" => {
+            // Настроить параметры Metal command buffer pool для стабильности.
+            // Workaround для AGXMetalG16X::fillBuffer SIGSEGV на M4 / macOS 26.x.
+            asr_core::metal_utils::configure_metal_env();
+
             // candle может panic в процессе инициализации Metal (например, если устройство недоступно).
             // Панику ловим, а hook временно глушим, чтобы не засорять stderr.
             let prev_hook = std::panic::take_hook();
