@@ -54,6 +54,54 @@ pub enum DecoderWeights {
     Gguf,
 }
 
+/// Repetition penalty (HuggingFace-style):
+/// для уже сгенерированных токенов положительный логит делится на penalty,
+/// отрицательный — умножается. Эффект: уменьшает вероятность повторений
+/// без полного запрета. Стандартное значение для ASR — 1.1 (мягкое).
+///
+/// Lookback ограничен последними `LOOKBACK` токенами — penalty не применяется
+/// к токенам из начала транскрипции (чтобы не подавлять легитимные
+/// возвращения к слову через 100 токенов).
+const REPETITION_PENALTY: f32 = 1.10;
+const REPETITION_LOOKBACK: usize = 64;
+
+fn apply_repetition_penalty(
+    logits: &candle_core::Tensor,
+    prev_tokens: &[u32],
+    penalty: f32,
+) -> Result<candle_core::Tensor> {
+    use candle_core::{DType, Tensor};
+    if prev_tokens.is_empty() || (penalty - 1.0).abs() < f32::EPSILON {
+        return Ok(logits.clone());
+    }
+    let device = logits.device().clone();
+    let dtype = logits.dtype();
+    let vocab = logits.dim(candle_core::D::Minus1)?;
+
+    // Конвертируем в плоский F32 vec для прямой модификации.
+    let flat = logits.to_dtype(DType::F32)?.flatten_all()?;
+    let mut data: Vec<f32> = flat.to_vec1()?;
+
+    let start = prev_tokens.len().saturating_sub(REPETITION_LOOKBACK);
+    let mut seen: std::collections::HashSet<u32> =
+        std::collections::HashSet::with_capacity(REPETITION_LOOKBACK);
+    for &t in &prev_tokens[start..] {
+        if seen.insert(t) {
+            let idx = t as usize;
+            if idx < vocab {
+                if data[idx] > 0.0 {
+                    data[idx] /= penalty;
+                } else {
+                    data[idx] *= penalty;
+                }
+            }
+        }
+    }
+
+    let new = Tensor::from_vec(data, (1, vocab), &device)?;
+    new.to_dtype(dtype)
+}
+
 impl AsrPipeline {
     fn looks_like_repetition_loop(tokens: &[u32]) -> bool {
         // Эвристика против "залипания" на квантованных/шумных прогонах (особенно Q4).
@@ -62,11 +110,42 @@ impl AsrPipeline {
         //
         // Правила достаточно консервативные, чтобы не срабатывать на коротких "угу/да".
         let n = tokens.len();
+
+        // === Ранняя проверка (n>=24): один токен подряд 16+ раз ===
+        // На Q4 моделях зацикливание начинается рано, не ждём 128 токенов.
+        if n >= 24 {
+            let last = tokens[n - 1];
+            let mut same = 1;
+            for &t in tokens[n.saturating_sub(16)..n - 1].iter().rev() {
+                if t == last { same += 1; } else { break; }
+            }
+            if same >= 16 {
+                return true;
+            }
+        }
+
+        // === Средняя проверка (n>=48): период 1..=4 повторяется 8+ раз ===
+        if n >= 48 {
+            for period in 1..=4 {
+                let blocks = 8;
+                let need = period * blocks;
+                if n < need { continue; }
+                let end = &tokens[n - period..n];
+                let mut ok = true;
+                for b in 2..=blocks {
+                    let s = n - b * period;
+                    let e = s + period;
+                    if tokens[s..e] != *end { ok = false; break; }
+                }
+                if ok { return true; }
+            }
+        }
+
         if n < 128 {
             return false;
         }
 
-        // 1) Низкое разнообразие на хвосте.
+        // === Старая проверка (n>=128): низкое разнообразие на хвосте ===
         let tail = &tokens[n.saturating_sub(96)..n];
         let mut uniq = std::collections::HashSet::with_capacity(tail.len());
         for &t in tail {
@@ -76,11 +155,9 @@ impl AsrPipeline {
             return true;
         }
 
-        // 2) Повторяющийся паттерн (фиксированный период) на хвосте.
-        // Проверяем несколько периодов, чтобы поймать и повторы одного токена,
-        // и повторы короткой фразы.
-        for period in 1..=16 {
-            let blocks = 6; // требуем минимум 6 одинаковых блоков подряд
+        // 2) Повторяющийся паттерн (фиксированный период) на хвосте — длинные периоды.
+        for period in 5..=16 {
+            let blocks = 6;
             let need = period * blocks;
             if n < need {
                 continue;
@@ -445,8 +522,16 @@ impl AsrPipeline {
         let mut last_logits = logits.i((.., logits.dim(1)? - 1, ..))?;
 
         for i in 0..max_tokens {
-            // Greedy: take argmax
-            let next_token = last_logits.argmax(candle_core::D::Minus1)?;
+            // Apply repetition penalty (HuggingFace-style) на уже сгенерированных
+            // токенах. Без этого квантованные модели (Q4_0 особенно) попадают
+            // в loop одного токена потому что argmax детерминистически выбирает
+            // одну и ту же максимальную позицию.
+            let penalized = apply_repetition_penalty(
+                &last_logits,
+                &generated_tokens,
+                REPETITION_PENALTY,
+            )?;
+            let next_token = penalized.argmax(candle_core::D::Minus1)?;
             let next_token_id: u32 = next_token.squeeze(0)?.to_scalar()?;
 
             if debug {
