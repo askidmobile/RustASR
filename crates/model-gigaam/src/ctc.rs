@@ -25,6 +25,7 @@ impl CtcHead {
             stride: 1,
             dilation: 1,
             groups: 1,
+            ..Default::default()
         };
         let conv = candle_nn::conv1d(feat_in, num_classes, 1, cfg, vb.pp("decoder_layers.0"))?;
         Ok(Self { conv, num_classes })

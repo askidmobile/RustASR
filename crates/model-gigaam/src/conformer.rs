@@ -109,6 +109,7 @@ impl StridingSubsampling {
             stride: 2,
             dilation: 1,
             groups: 1,
+            ..Default::default()
         };
 
         let mut convs = Vec::with_capacity(n_layers);
@@ -331,6 +332,7 @@ impl ConformerConvolution {
             stride: 1,
             dilation: 1,
             groups: 1,
+            ..Default::default()
         };
         let pointwise_conv1 =
             candle_nn::conv1d(d_model, d_model * 2, 1, pw1_cfg, vb.pp("pointwise_conv1"))?;
@@ -341,6 +343,7 @@ impl ConformerConvolution {
             stride: 1,
             dilation: 1,
             groups: d_model,
+            ..Default::default()
         };
         let depthwise_conv = candle_nn::conv1d(
             d_model,
@@ -359,6 +362,7 @@ impl ConformerConvolution {
             stride: 1,
             dilation: 1,
             groups: 1,
+            ..Default::default()
         };
         let pointwise_conv2 =
             candle_nn::conv1d(d_model, d_model, 1, pw2_cfg, vb.pp("pointwise_conv2"))?;

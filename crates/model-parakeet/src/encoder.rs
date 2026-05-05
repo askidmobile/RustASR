@@ -263,6 +263,7 @@ fn conv2d_manual(
         padding,
         dilation: 1,
         groups,
+        ..Default::default()
     };
     let out = x.conv2d(weight, padding, stride, 1, groups)?;
     if let Some(b) = bias {

@@ -53,10 +53,13 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 
-# ML / Tensor backend
-candle-core = { version = "0.8", features = ["metal"] }
-candle-nn = { version = "0.8", features = ["metal"] }
-candle-transformers = { version = "0.8", features = ["metal"] }
+# ML / Tensor backend — askidmobile candle-fork 0.9.2 (общий с Yttri).
+# Содержит Metal patches: compute_per_buffer=15, sync per layer, native dequantize_f16.
+# См. [patch] секцию ниже — резолвится в локальный ../candle-fork/.
+candle-core = { git = "https://github.com/askidmobile/candle.git", branch = "main", features = ["metal"] }
+candle-nn = { git = "https://github.com/askidmobile/candle.git", branch = "main", features = ["metal"] }
+candle-transformers = { git = "https://github.com/askidmobile/candle.git", branch = "main", features = ["metal"] }
+candle-metal-kernels = { git = "https://github.com/askidmobile/candle.git", branch = "main" }
 safetensors = "0.5"
 
 # Tokenization
@@ -96,3 +99,15 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 2
+
+# ============================================
+# Локальный candle-fork (0.9.2) — общий с Yttri.
+# Patch резолвит git deps на локальные пути для быстрой итерации
+# и применения Yttri-патчей (Metal compute_per_buffer=15, per-layer sync, etc).
+# ============================================
+[patch."https://github.com/askidmobile/candle.git"]
+candle-core = { path = "../candle-fork/candle-core" }
+candle-nn = { path = "../candle-fork/candle-nn" }
+candle-transformers = { path = "../candle-fork/candle-transformers" }
+candle-metal-kernels = { path = "../candle-fork/candle-metal-kernels" }
+candle-ug = { path = "../candle-fork/candle-ug" }
