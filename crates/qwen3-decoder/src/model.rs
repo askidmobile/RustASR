@@ -231,6 +231,11 @@ impl Qwen3Decoder {
     }
 
     /// Load decoder from gguf file.
+    ///
+    /// **Замечание Phase 7.D #3:** на macOS mmap (`from_gguf_mmap`) наоборот
+    /// УВЕЛИЧИВАЕТ peak RSS на ~300 МБ для Q8 (mmap pages count в RSS pmem stat,
+    /// а heap allocations через legacy `from_gguf` drop'аются после upload).
+    /// Поэтому оставляем legacy path.
     pub fn from_gguf(config: Qwen3Config, path: impl AsRef<Path>, device: &Device) -> Result<Self> {
         let vb = quantized_vb::VarBuilder::from_gguf(path.as_ref(), device)?;
         Self::new(config, Weights::Quantized(vb.pp("thinker.model")), device)
