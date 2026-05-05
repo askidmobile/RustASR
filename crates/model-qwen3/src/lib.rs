@@ -5,4 +5,5 @@
 
 mod model;
 
+pub use asr_pipeline::DecoderWeights;
 pub use model::Qwen3AsrModel;
