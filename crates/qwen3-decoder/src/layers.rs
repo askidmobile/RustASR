@@ -35,11 +35,14 @@ impl LinearLayer {
             Self::Quantized(l) => {
                 // Candle Metal QMatMul kernel принимает F16 input напрямую
                 // для Q4_0..Q6_K (candle-fork F16 QMatMul Phase 1-3).
-                // Output остаётся F32 (kernel пишет float dst), поэтому
-                // cast обратно к dtype входа сохраняем для совместимости
-                // с downstream layers.
+                // BF16/прочие dtype → fallback на F32 cast (Phase 7 для BF16
+                // и IQ опц.). Output kernel — F32; cast обратно к input dtype
+                // сохраняем для совместимости с downstream layers.
                 let x_dtype = x.dtype();
-                let y = l.forward(x)?;
+                let y = match x_dtype {
+                    DType::F32 | DType::F16 => l.forward(x)?,
+                    _ => l.forward(&x.to_dtype(DType::F32)?)?,
+                };
                 if y.dtype() == x_dtype {
                     Ok(y)
                 } else {
