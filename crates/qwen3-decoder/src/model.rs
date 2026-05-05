@@ -125,13 +125,13 @@ impl Qwen3Decoder {
         let norm = match weights.pp("norm") {
             Weights::Standard(vb) => RmsNorm::new(config.hidden_size, config.rms_norm_eps, vb)?,
             Weights::Quantized(vb) => {
-                // RMS norm — маленький (hidden_size = 1024), dequantize на CPU
-                // и to_device(Metal) даёт 1 буфер вместо blit pipeline overhead
-                // (см. Yttri rms_norm_cpu в quantized_qwen35.rs).
+                // Phase 7.D #1: GPU dequant_f16 вместо CPU staging.
+                // CPU staging оставлял intermediate F32 буфер на CPU heap который
+                // не освобождался сразу — вклад в +1.4 ГБ CPU/mmap residual для
+                // Q8 модели (Phase 7.D profiling в comprehensive_asr_table).
                 let mut w = vb
                     .get((config.hidden_size,), "weight")?
-                    .dequantize(&Device::Cpu)?
-                    .to_device(device)?;
+                    .dequantize_f16(device)?;
                 if w.dtype() != target_dtype {
                     w = w.to_dtype(target_dtype)?;
                 }

@@ -196,11 +196,13 @@ impl Attention {
                 } else {
                     DType::F32
                 };
-                // RMS norm — маленький, CPU dequant + to_device избегает Metal blit overhead.
+                // Phase 7.D #1: GPU dequant_f16 вместо CPU staging.
+                // CPU staging оставлял ~1.4 ГБ CPU/mmap residual для Q8.
+                // dequantize_f16 на Metal делает GPU kernel dequantize в F16 buffer
+                // напрямую, без F32 CPU buffer. Для CPU device — fallback внутри.
                 let mut w = vb
                     .get((head_dim,), "weight")?
-                    .dequantize(&candle_core::Device::Cpu)?
-                    .to_device(vb.device())?;
+                    .dequantize_f16(vb.device())?;
                 if w.dtype() != target_dtype {
                     w = w.to_dtype(target_dtype)?;
                 }
@@ -215,11 +217,10 @@ impl Attention {
                 } else {
                     DType::F32
                 };
-                // RMS norm — маленький, CPU dequant + to_device избегает Metal blit overhead.
+                // Phase 7.D #1: GPU dequant_f16 (см. q_norm выше).
                 let mut w = vb
                     .get((head_dim,), "weight")?
-                    .dequantize(&candle_core::Device::Cpu)?
-                    .to_device(vb.device())?;
+                    .dequantize_f16(vb.device())?;
                 if w.dtype() != target_dtype {
                     w = w.to_dtype(target_dtype)?;
                 }
@@ -438,10 +439,10 @@ impl DecoderLayer {
                 } else {
                     DType::F32
                 };
+                // Phase 7.D #1: GPU dequant_f16 (см. q_norm).
                 let mut w = vb
                     .get((config.hidden_size,), "weight")?
-                    .dequantize(&candle_core::Device::Cpu)?
-                    .to_device(vb.device())?;
+                    .dequantize_f16(vb.device())?;
                 if w.dtype() != target_dtype {
                     w = w.to_dtype(target_dtype)?;
                 }
@@ -456,10 +457,10 @@ impl DecoderLayer {
                 } else {
                     DType::F32
                 };
+                // Phase 7.D #1: GPU dequant_f16 (см. q_norm).
                 let mut w = vb
                     .get((config.hidden_size,), "weight")?
-                    .dequantize(&candle_core::Device::Cpu)?
-                    .to_device(vb.device())?;
+                    .dequantize_f16(vb.device())?;
                 if w.dtype() != target_dtype {
                     w = w.to_dtype(target_dtype)?;
                 }
