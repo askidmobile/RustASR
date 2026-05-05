@@ -90,7 +90,12 @@ impl AuTEncoder {
         };
 
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(paths, dtype, device)? };
-        Self::new(config, vb.pp("thinker.audio_tower"), device, dtype)
+        let encoder = Self::new(config, vb.pp("thinker.audio_tower"), device, dtype)?;
+        // Phase 7.D #4: освобождаем mmap pages после copy в device buffers.
+        // На macOS file-backed mmap pages засчитываются в RSS — для крупного
+        // audio_tower (FP weights ~500-800 МБ) это вклад в peak RSS.
+        vb.advise_mmap_dontneed();
+        Ok(encoder)
     }
 
     /// Forward pass through the encoder.
