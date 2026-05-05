@@ -253,7 +253,9 @@ enum Commands {
         #[arg(long, short = 'o')]
         output: PathBuf,
 
-        /// Quantization type: q8_0, q6k, q4_0
+        /// Quantization type: q8_0, q6k, q5k, q4k (рекомендован вместо q4_0), q4_0, q2k.
+        /// q4k/q5k/q2k используют make_qkx2_quants (порт llama.cpp ref) — качество
+        /// сравнимо с llama.cpp llama-quantize (без imatrix).
         #[arg(long, default_value = "q8_0")]
         qtype: String,
 
@@ -1764,6 +1766,52 @@ fn create_device(device: &str) -> Result<candle_core::Device> {
     }
 }
 
+/// Парсит индекс слоя из tensor name типа `<scope>layers.{N}.<...>`.
+/// Возвращает None если паттерн не совпадает.
+fn parse_layer_index(name: &str, scope: &str) -> Option<usize> {
+    let rest = name.strip_prefix(scope)?;
+    let rest = rest.strip_prefix("layers.")?;
+    let dot = rest.find('.')?;
+    rest[..dot].parse::<usize>().ok()
+}
+
+/// Эвристика llama.cpp `use_more_bits` — определяет, какие слои получают
+/// повышенную точность в `_M` mixed schemes.
+/// Источник: gguf-quantize/llama.cpp/src/llama-quant.cpp:185-187.
+fn use_more_bits(i_layer: usize, n_layer: usize) -> bool {
+    i_layer < n_layer / 8
+        || i_layer >= 7 * n_layer / 8
+        || (i_layer.saturating_sub(n_layer / 8)) % 3 == 2
+}
+
+/// Выбор GgmlDType для tensor в Q4_K_M mixed scheme. Реализует основные
+/// правила llama_tensor_get_type для не-MoE архитектур (LLM_TYPE_70B и MoE
+/// специальная логика опущена).
+///
+/// Tensor names для Qwen3:
+///   - `<scope>layers.{N}.self_attn.v_proj.weight`  → llama.cpp attn_v
+///   - `<scope>layers.{N}.mlp.down_proj.weight`     → llama.cpp ffn_down
+///   - `<scope>layers.{N}.self_attn.{q,k,o}_proj.weight`, mlp.{gate,up}_proj → Q4_K
+fn pick_q4_k_m_type(name: &str, n_layer: usize) -> candle_core::quantized::GgmlDType {
+    use candle_core::quantized::GgmlDType;
+    let is_attn_v = name.contains(".self_attn.v_proj.weight");
+    let is_ffn_down = name.contains(".mlp.down_proj.weight");
+    if is_attn_v || is_ffn_down {
+        // Извлекаем i_layer из name. Если не парсится — fallback Q4_K.
+        let i_layer = name
+            .find("layers.")
+            .and_then(|p| {
+                let after = &name[p + "layers.".len()..];
+                after.find('.').and_then(|d| after[..d].parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        if use_more_bits(i_layer, n_layer) {
+            return GgmlDType::Q6K;
+        }
+    }
+    GgmlDType::Q4K
+}
+
 fn run_quantize(
     input: PathBuf,
     output: PathBuf,
@@ -1798,11 +1846,31 @@ fn run_quantize(
         }
     };
 
+    // qtype matrix:
+    //   q8_0     — naive ref алгоритм (8 bit, max качество среди легаси)
+    //   q6k      — K-quants superblock через make_qx_quants (как llama.cpp ref)
+    //   q5k      — K-quants superblock через make_qkx2_quants (как llama.cpp ref)
+    //   q4k_s    — все linear → Q4_K (как llama.cpp Q4_K_S)
+    //   q4k_m    — mixed scheme как llama.cpp Q4_K_M:
+    //                attn_v + ffn_down с use_more_bits(i_layer) → Q6_K
+    //                остальные → Q4_K
+    //              даёт лучшее качество за тот же размер чем q4k_s или q4_0.
+    //   q4k      — alias для q4k_s (legacy)
+    //   q4_0     — legacy naive ref (без grid search, без weights) — оставлен
+    //              для совместимости со старыми скриптами
+    //   q2k      — K-quants superblock через make_qkx2_quants (для max сжатия)
+    let mixed_q4_k_m = matches!(qtype, "q4_k_m" | "q4km");
     let ggml = match qtype {
         "q8_0" => GgmlDType::Q8_0,
         "q6k" | "q6_k" => GgmlDType::Q6K,
+        "q5k" | "q5_k" => GgmlDType::Q5K,
+        "q4k_s" | "q4_k_s" | "q4k" | "q4_k" => GgmlDType::Q4K,
+        "q4_k_m" | "q4km" => GgmlDType::Q4K, // base type; Q6_K override per-tensor (см. ниже)
         "q4_0" => GgmlDType::Q4_0,
-        other => anyhow::bail!("Unsupported qtype: {other} (expected: q8_0, q6k, q4_0)"),
+        "q2k" | "q2_k" => GgmlDType::Q2K,
+        other => anyhow::bail!(
+            "Unsupported qtype: {other} (expected: q8_0, q6k, q5k, q4k, q4_k_m, q4_0, q2k)"
+        ),
     };
 
     info!(
@@ -1816,9 +1884,29 @@ fn run_quantize(
     );
 
     let device = Device::Cpu;
+
+    // === Pass 1: pre-scan для определения n_layer (нужно для Q4_K_M mixed scheme).
+    // Парсим tensor name pattern `<scope>layers.{N}.` чтобы найти max layer index.
+    let mut n_layer: usize = 0;
+    if mixed_q4_k_m {
+        for f in &safetensors_files {
+            let tensors_meta = candle_core::safetensors::load(f, &device)
+                .with_context(|| format!("Failed to load safetensors shard: {}", f.display()))?;
+            for (name, _) in &tensors_meta {
+                if let Some(idx) = parse_layer_index(name, scope) {
+                    if idx + 1 > n_layer {
+                        n_layer = idx + 1;
+                    }
+                }
+            }
+        }
+        info!(n_layer, "Q4_K_M: detected layer count");
+    }
+
     let mut out_tensors: Vec<(String, QTensor)> = Vec::new();
     let mut num_quantized = 0usize;
     let mut num_kept = 0usize;
+    let mut num_q6k_overrides = 0usize;
 
     for f in safetensors_files {
         let tensors = candle_core::safetensors::load(&f, &device)
@@ -1840,7 +1928,22 @@ fn run_quantize(
                 && (!is_embedding || quantize_embeddings);
 
             if should_quantize {
-                let qt = QTensor::quantize(&tensor, ggml)?;
+                // Q4_K_M mixed scheme — port из llama.cpp src/llama-quant.cpp:
+                //   - attn_v.weight (self_attn.v_proj) + ffn_down (mlp.down_proj):
+                //     Q6_K если use_more_bits(i_layer, n_layer), иначе Q4_K
+                //   - всё остальное → Q4_K (base type)
+                //
+                // use_more_bits(i, n) = i < n/8 || i >= 7*n/8 || (i - n/8) % 3 == 2
+                // → ~25% layers получают Q6_K boost.
+                let dtype_for_tensor = if mixed_q4_k_m && n_layer > 0 {
+                    pick_q4_k_m_type(&name, n_layer)
+                } else {
+                    ggml
+                };
+                if dtype_for_tensor == GgmlDType::Q6K && ggml == GgmlDType::Q4K {
+                    num_q6k_overrides += 1;
+                }
+                let qt = QTensor::quantize(&tensor, dtype_for_tensor)?;
                 out_tensors.push((name, qt));
                 num_quantized += 1;
             } else {
@@ -1858,7 +1961,17 @@ fn run_quantize(
         }
     }
 
-    info!(num_quantized, num_kept, "Prepared tensors");
+    if mixed_q4_k_m {
+        info!(
+            num_quantized,
+            num_kept,
+            num_q6k_overrides,
+            n_layer,
+            "Q4_K_M mixed: Q6_K overrides applied to attn_v/ffn_down on use_more_bits layers"
+        );
+    } else {
+        info!(num_quantized, num_kept, "Prepared tensors");
+    }
 
     let mut f = std::fs::File::create(&output)?;
     let refs: Vec<(&str, &QTensor)> = out_tensors.iter().map(|(n, t)| (n.as_str(), t)).collect();

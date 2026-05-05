@@ -23,9 +23,20 @@
 
 ## Схемы квантования
 
-- `q8_0` — основной режим (качество максимально близко к FP16)
-- `q6k` — компромисс (если хотим ещё меньше памяти)
-- `q4_0` — максимальная экономия памяти, но риск деградации качества выше
+После реализации `make_qkx2_quants` (порт llama.cpp ref) и mixed scheme `q4_k_m`:
+
+- `q8_0`   — основной режим (качество максимально близко к FP16)
+- `q6k`    — K-quants superblock через `make_qx_quants` (как llama.cpp ref)
+- `q5k`    — K-quants через `make_qkx2_quants` (как llama.cpp ref)
+- `q4_k_m` — **рекомендован**: mixed scheme как llama.cpp Q4_K_M.
+             attn_v + ffn_down на `use_more_bits` слоях → Q6_K, остальные → Q4_K.
+             Качество идентично llama.cpp Q4_K_M (verified side-by-side на
+             4 RU/EN/mixed audio).
+- `q4k`    — alias для `q4_k_s`: все linear → Q4_K (хуже чем q4_k_m).
+- `q4_0`   — legacy naive 4-bit (без super-blocks). Качество ограничено
+             форматом, не алгоритмом — candle и llama.cpp дают одинаковый
+             результат для Q4_0 (без imatrix). Рекомендован переход на q4_k_m.
+- `q2k`    — максимальное сжатие, через `make_qkx2_quants`.
 
 ## Реализация (шаги)
 
