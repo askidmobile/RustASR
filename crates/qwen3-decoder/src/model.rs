@@ -99,13 +99,11 @@ impl Qwen3Decoder {
             let layer =
                 DecoderLayer::new(&config, weights.pp(format!("layers.{}", i)), rope.clone())?;
             layers.push(layer);
-            // Periodic flush — освобождает intermediate dequantize/blit буферы
-            // которые иначе аккумулируются в Metal pool (×3-4 от размера весов).
-            if (i + 1) % 4 == 0 {
-                flush_metal_pool_silent(device);
-            }
+            // Per-layer flush — каждый слой создаёт ~10 intermediate dequantize
+            // буферов (Q/K/V/O proj + 3 MLP + 2 RmsNorm). Без flush они
+            // аккумулируются в Metal pool до конца loop.
+            flush_metal_pool_silent(device);
         }
-        flush_metal_pool_silent(device);
 
         let norm = match weights.pp("norm") {
             Weights::Standard(vb) => RmsNorm::new(config.hidden_size, config.rms_norm_eps, vb)?,
