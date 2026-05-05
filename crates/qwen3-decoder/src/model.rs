@@ -2,6 +2,7 @@
 
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{Embedding, Module, VarBuilder};
+use candle_transformers::models::quantized_qwen3::ModelWeights as LlamaCppQwen3;
 use candle_transformers::quantized_var_builder as quantized_vb;
 use std::path::Path;
 
@@ -20,6 +21,17 @@ fn flush_metal_pool_silent(device: &Device) {
 /// Qwen3 Language Model Decoder.
 ///
 /// Converts audio embeddings (from AuT encoder) to text tokens.
+/// Qwen3 Language Model Decoder.
+///
+/// Имеет два пути загрузки:
+/// 1. **Custom HF naming** (старый, для существующих GGUF с `thinker.model.*`
+///    тензорами и safetensors в HF формате) — поля embed_tokens/layers/norm/lm_head.
+/// 2. **llama.cpp naming** (новый, через `quantized_qwen3::ModelWeights`) —
+///    для GGUF от `convert_hf_to_gguf.py` с `blk.X.attn_q.weight` тензорами и
+///    Q4_K_M / Q5_K_M / Q6_K квантами. Поле `llama_cpp_model`.
+///
+/// Когда `llama_cpp_model = Some(...)`, **forward методы делегируют ему**
+/// и игнорируют custom поля (они dummy-инициализированы для сохранения API).
 #[derive(Debug, Clone)]
 pub struct Qwen3Decoder {
     config: Qwen3Config,
@@ -27,6 +39,11 @@ pub struct Qwen3Decoder {
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
     lm_head: LmHead,
+    /// Если Some — все forward методы делегируют сюда (llama.cpp Q4_K_M path).
+    llama_cpp_model: Option<std::sync::Arc<std::sync::Mutex<LlamaCppQwen3>>>,
+    /// Cached embedding для llama_cpp path — нужен для get_embed_tokens().
+    /// Извлекается из `llama_cpp_model.embed_tokens()` при load.
+    llama_cpp_embed: Option<Embedding>,
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +149,56 @@ impl Qwen3Decoder {
             layers,
             norm,
             lm_head,
+            llama_cpp_model: None,
+            llama_cpp_embed: None,
+        })
+    }
+
+    /// Load decoder from llama.cpp-style GGUF (от `convert_hf_to_gguf.py`)
+    /// через `quantized_qwen3::ModelWeights`. Поддерживает Q4_K_M, Q5_K_M, Q6_K
+    /// и другие K-quants — недоступные через старый custom loader.
+    ///
+    /// Tensor naming: `token_embd.weight`, `blk.X.attn_q.weight`, etc.
+    /// Metadata key prefix: `qwen3.*` или `qwen3vl.*` (Qwen3-ASR text часть).
+    ///
+    /// Audio encoder (AuTEncoder) загружается отдельно из safetensors —
+    /// этот метод грузит ТОЛЬКО LLM decoder.
+    pub fn from_llama_cpp_gguf(
+        config: Qwen3Config,
+        path: impl AsRef<Path>,
+        device: &Device,
+    ) -> Result<Self> {
+        use candle_core::quantized::gguf_file;
+        let path = path.as_ref();
+        let mut file = std::fs::File::open(path)
+            .map_err(|e| candle_core::Error::Msg(format!("open GGUF {:?}: {}", path, e)))?;
+        let content = gguf_file::Content::read(&mut file)?;
+        let model = LlamaCppQwen3::from_gguf(content, &mut file, device)?;
+        // Кэшируем embed_tokens — get_embed_tokens() возвращает &Embedding,
+        // поэтому нужно держать копию вне Mutex.
+        let embed_cached = model.embed_tokens().clone();
+
+        // Dummy-инициализация custom fields — они не используются когда
+        // llama_cpp_model = Some(...), но нужны для совместимости struct.
+        let dummy_embed = Embedding::new(
+            Tensor::zeros((1, 1), DType::F32, device)?,
+            1,
+        );
+        let dummy_norm = RmsNorm::from_weight(
+            Tensor::zeros((config.hidden_size,), DType::F32, device)?,
+            config.rms_norm_eps,
+        )?;
+
+        Ok(Self {
+            config,
+            embed_tokens: dummy_embed.clone(),
+            layers: Vec::new(),
+            norm: dummy_norm,
+            lm_head: LmHead {
+                weight: Tensor::zeros((1, 1), DType::F32, device)?,
+            },
+            llama_cpp_model: Some(std::sync::Arc::new(std::sync::Mutex::new(model))),
+            llama_cpp_embed: Some(embed_cached),
         })
     }
 
@@ -176,8 +243,18 @@ impl Qwen3Decoder {
     /// * `start_pos` - Starting position for KV cache
     ///
     /// # Returns
-    /// Logits [batch, seq_len, vocab_size]
+    /// Logits [batch, seq_len, vocab_size] (custom path) or [batch, 1, vocab_size] (llama.cpp)
     pub fn forward(&self, input_ids: &Tensor, start_pos: usize) -> Result<Tensor> {
+        if let Some(model) = &self.llama_cpp_model {
+            let mut model = model.lock().expect("llama_cpp model mutex poisoned");
+            if start_pos == 0 {
+                model.clear_kv_cache();
+            }
+            // ModelWeights.forward возвращает [batch, vocab] (last logits) —
+            // unsqueeze(1) для совместимости с layout [batch, seq=1, vocab].
+            return model.forward(input_ids, start_pos)?.unsqueeze(1);
+        }
+
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
 
         for layer in &self.layers {
@@ -233,6 +310,9 @@ impl Qwen3Decoder {
 
     /// Get the token embedding layer (for building prompts externally).
     pub fn get_embed_tokens(&self) -> &Embedding {
+        if let Some(emb) = &self.llama_cpp_embed {
+            return emb;
+        }
         &self.embed_tokens
     }
 
@@ -243,8 +323,16 @@ impl Qwen3Decoder {
     /// * `start_pos` - Starting position for positional encoding
     ///
     /// # Returns
-    /// Logits [batch, seq_len, vocab_size]
+    /// Logits [batch, seq_len, vocab_size] (custom) or [batch, 1, vocab_size] (llama.cpp)
     pub fn forward_embeds(&self, embeds: &Tensor, start_pos: usize) -> Result<Tensor> {
+        if let Some(model) = &self.llama_cpp_model {
+            let mut model = model.lock().expect("llama_cpp model mutex poisoned");
+            if start_pos == 0 {
+                model.clear_kv_cache();
+            }
+            return model.forward_embeds(embeds, start_pos)?.unsqueeze(1);
+        }
+
         let debug = asr_core::debug::enabled();
         if debug {
             eprintln!(
@@ -292,6 +380,20 @@ impl Qwen3Decoder {
         start_pos: usize,
         cache: &mut KvCache,
     ) -> Result<Tensor> {
+        if let Some(model) = &self.llama_cpp_model {
+            // ModelWeights использует ВНУТРЕННИЙ KV cache в LayerWeights —
+            // внешний `cache` параметр игнорируем. Pipeline должен вызывать
+            // start_pos=0 для prefill и инкрементировать для decode steps.
+            let mut model = model.lock().expect("llama_cpp model mutex poisoned");
+            if start_pos == 0 {
+                model.clear_kv_cache();
+            }
+            // forward_embeds возвращает [batch, vocab] — unsqueeze(1) до
+            // [batch, 1, vocab] для совместимости с custom layout.
+            let _ = cache; // явно подавляем unused warning
+            return model.forward_embeds(embeds, start_pos)?.unsqueeze(1);
+        }
+
         let debug = asr_core::debug::enabled();
         let mut hidden_states = embeds.clone();
 

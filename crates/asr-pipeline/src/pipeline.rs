@@ -102,6 +102,29 @@ fn apply_repetition_penalty(
     new.to_dtype(dtype)
 }
 
+/// Проверяет является ли GGUF llama.cpp-style (от convert_hf_to_gguf.py)
+/// vs custom HF-naming (legacy). Smartly детектит по metadata.
+fn is_llama_cpp_qwen3_gguf(path: &Path) -> bool {
+    use candle_core::quantized::gguf_file;
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let content = match gguf_file::Content::read(&mut file) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    // Признак llama.cpp: presence of general.architecture metadata.
+    // custom RustASR GGUF не записывает эту key.
+    if let Some(v) = content.metadata.get("general.architecture") {
+        if let Ok(arch) = v.to_string() {
+            // Поддерживаемые: qwen3, qwen3vl (для Qwen3-ASR).
+            return arch == "qwen3" || arch == "qwen3vl";
+        }
+    }
+    false
+}
+
 impl AsrPipeline {
     fn looks_like_repetition_loop(tokens: &[u32]) -> bool {
         // Эвристика против "залипания" на квантованных/шумных прогонах (особенно Q4).
@@ -268,9 +291,23 @@ impl AsrPipeline {
         let st_refs: Vec<&Path> = safetensors_files.iter().map(|p| p.as_path()).collect();
         let encoder = AuTEncoder::from_safetensors_files(aut_config, &st_refs, device)?;
 
-        // Load decoder (prefer GGUF if present)
+        // Load decoder (prefer GGUF if present).
+        //
+        // Авто-detect формата GGUF:
+        //   - llama.cpp-style (от convert_hf_to_gguf.py): metadata содержит
+        //     `general.architecture` = "qwen3" или "qwen3vl", тензоры с
+        //     именами `blk.X.attn_q.weight`. Грузим через quantized_qwen3
+        //     (поддержка Q4_K_M, Q5_K_M, Q6_K).
+        //   - custom HF naming (legacy): тензоры `thinker.model.layers.X.self_attn.q_proj.weight`.
+        //     Без `general.architecture` metadata. Грузим custom loader.
         let decoder = if let Some(p) = decoder_gguf {
-            Qwen3Decoder::from_gguf(qwen3_config, &p, device)?
+            if is_llama_cpp_qwen3_gguf(&p) {
+                eprintln!("Loading decoder from llama.cpp-style GGUF: {:?}", p);
+                Qwen3Decoder::from_llama_cpp_gguf(qwen3_config, &p, device)?
+            } else {
+                eprintln!("Loading decoder from custom HF-style GGUF: {:?}", p);
+                Qwen3Decoder::from_gguf(qwen3_config, &p, device)?
+            }
         } else {
             Qwen3Decoder::from_safetensors_files(qwen3_config, &st_refs, device)?
         };
@@ -498,7 +535,20 @@ impl AsrPipeline {
             );
         }
 
-        // Concatenate: prefix + audio + suffix
+        // Concatenate: prefix + audio + suffix.
+        // Все три должны быть в одном dtype — приводим к dtype prefix_embeds
+        // (определяется decoder'ом: BF16 для custom Metal, F16 для llama.cpp Metal).
+        let target_dtype = prefix_embeds.dtype();
+        let audio_embeds = if audio_embeds.dtype() != target_dtype {
+            audio_embeds.to_dtype(target_dtype)?
+        } else {
+            audio_embeds.clone()
+        };
+        let suffix_embeds = if suffix_embeds.dtype() != target_dtype {
+            suffix_embeds.to_dtype(target_dtype)?
+        } else {
+            suffix_embeds
+        };
         let prompt_embeds = Tensor::cat(&[&prefix_embeds, &audio_embeds, &suffix_embeds], 1)?;
         if debug {
             eprintln!(
