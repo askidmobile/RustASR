@@ -33,20 +33,19 @@ impl LinearLayer {
         match self {
             Self::Standard(l) => l.forward(x),
             Self::Quantized(l) => {
-                // Квантованные матмулы в candle часто работают в f32.
-                // Для совместимости с остальным графом приводим вход/выход к dtype x.
+                // Candle Metal QMatMul kernel требует F32 input (assertion в
+                // metal.rs:402). Cast в F32 → matmul → cast обратно. Auto-cast
+                // в Metal QMatMul пытались сделать в candle-fork, но из-за
+                // конфликта command_encoder вызвало deadlock — откатили.
+                //
+                // Текущее состояние: внешний cast обязателен. Memory churn
+                // mitigated через flush_metal_pool() per 8 decode steps.
                 let x_dtype = x.dtype();
-                let x_f32 = if x_dtype != DType::F32 {
-                    x.to_dtype(DType::F32)?
-                } else {
-                    x.clone()
-                };
-                let y = l.forward(&x_f32)?;
-                if y.dtype() != x_dtype {
-                    y.to_dtype(x_dtype)
-                } else {
-                    Ok(y)
+                if x_dtype == DType::F32 {
+                    return l.forward(x);
                 }
+                let y = l.forward(&x.to_dtype(DType::F32)?)?;
+                y.to_dtype(x_dtype)
             }
         }
     }

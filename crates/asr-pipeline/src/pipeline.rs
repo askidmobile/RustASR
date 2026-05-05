@@ -102,6 +102,14 @@ fn apply_repetition_penalty(
     new.to_dtype(dtype)
 }
 
+/// Освобождение Metal buffer pool (silent — без warnings, для частых вызовов).
+fn flush_metal_pool(device: &Device) {
+    if device.is_metal() {
+        let _ = device.synchronize();
+        let _ = device.flush_buffers();
+    }
+}
+
 /// Проверяет является ли GGUF llama.cpp-style (от convert_hf_to_gguf.py)
 /// vs custom HF-naming (legacy). Smartly детектит по metadata.
 fn is_llama_cpp_qwen3_gguf(path: &Path) -> bool {
@@ -571,6 +579,11 @@ impl AsrPipeline {
             .forward_embeds_with_cache(&prompt_embeds, 0, &mut cache)?;
         let mut last_logits = logits.i((.., logits.dim(1)? - 1, ..))?;
 
+        // Освободить prefill intermediate буферы (attention scores + softmax
+        // на длинной prompt sequence). Без flush после prefill эти буферы
+        // залипают в Metal pool до конца decode loop.
+        flush_metal_pool(&self.device);
+
         for i in 0..max_tokens {
             // Apply repetition penalty (HuggingFace-style) на уже сгенерированных
             // токенах. Без этого квантованные модели (Q4_0 особенно) попадают
@@ -609,7 +622,18 @@ impl AsrPipeline {
                     .forward_embeds_with_cache(&next_embed, cur_pos, &mut cache)?;
             cur_pos += 1;
             last_logits = step_logits.i((.., step_logits.dim(1)? - 1, ..))?;
+
+            // Periodic flush в decode loop — Q/K/V/O/MLP linear paths
+            // создают F32 intermediate буферы (LinearLayer cast BF16↔F32),
+            // attention scores и softmax. На каждом step ~14 буферов ×
+            // 28 layers = 400 интермедиатов. Без flush per-step pool
+            // распухает до GB. Аналог Yttri Local LLM
+            // (см. ai/local_llm/quantized_qwen35.rs flush per chunk).
+            if (i + 1) % 8 == 0 {
+                flush_metal_pool(&self.device);
+            }
         }
+        flush_metal_pool(&self.device);
 
         Ok((generated_tokens, stop_reason))
     }
