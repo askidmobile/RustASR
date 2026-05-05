@@ -232,12 +232,31 @@ impl Qwen3Decoder {
 
     /// Load decoder from gguf file.
     ///
-    /// **Замечание Phase 7.D #3:** на macOS mmap (`from_gguf_mmap`) наоборот
-    /// УВЕЛИЧИВАЕТ peak RSS на ~300 МБ для Q8 (mmap pages count в RSS pmem stat,
-    /// а heap allocations через legacy `from_gguf` drop'аются после upload).
-    /// Поэтому оставляем legacy path.
+    /// **Phase 7.D #6 (после диагноза 9 ГБ test peak):** прямая загрузка
+    /// в GPU память через `from_gguf_mmap_zero_copy` (как в Yttri Local LLM
+    /// `quantized_qwen35::from_gguf_zero_copy`). Создаёт ОДИН Metal NoCopy
+    /// buffer на весь mmap'd файл — каждый тензор ссылается на свою часть
+    /// через offset, БЕЗ копирования. Это устраняет heap CPU allocations
+    /// (Phase 7.D #5 scratch) и mmap residual (Phase 7.D #3 issue) одновременно.
+    ///
+    /// На non-Metal device fallback к legacy `from_gguf`.
     pub fn from_gguf(config: Qwen3Config, path: impl AsRef<Path>, device: &Device) -> Result<Self> {
-        let vb = quantized_vb::VarBuilder::from_gguf(path.as_ref(), device)?;
+        let vb = if device.is_metal() {
+            // Zero-copy: mmap → Metal NoCopy buffer → sub-views для каждого tensor.
+            // Это direct-GPU pattern что Yttri Local LLM использует (см. quantized_qwen35.rs).
+            // На fail (file size не page-aligned, etc) fallback к legacy.
+            match quantized_vb::VarBuilder::from_gguf_mmap_zero_copy(path.as_ref(), device) {
+                Ok(vb) => vb,
+                Err(e) => {
+                    eprintln!(
+                        "[qwen3-decoder] from_gguf_mmap_zero_copy failed, fallback to legacy from_gguf: {e}"
+                    );
+                    quantized_vb::VarBuilder::from_gguf(path.as_ref(), device)?
+                }
+            }
+        } else {
+            quantized_vb::VarBuilder::from_gguf(path.as_ref(), device)?
+        };
         Self::new(config, Weights::Quantized(vb.pp("thinker.model")), device)
     }
 
