@@ -9,6 +9,14 @@ use crate::cache::KvCache;
 use crate::config::Qwen3Config;
 use crate::layers::{DecoderLayer, RmsNorm, RotaryEmbedding, Weights};
 
+/// Silent-вариант flush для Metal — без `tracing` warnings (вызывается часто).
+fn flush_metal_pool_silent(device: &Device) {
+    if device.is_metal() {
+        let _ = device.synchronize();
+        let _ = device.flush_buffers();
+    }
+}
+
 /// Qwen3 Language Model Decoder.
 ///
 /// Converts audio embeddings (from AuT encoder) to text tokens.
@@ -38,6 +46,16 @@ impl LmHead {
 
 impl Qwen3Decoder {
     /// Create a new Qwen3 decoder from weights.
+    ///
+    /// Memory-engineering (по образцу Yttri Local LLM):
+    /// - **`dequantize_f16(device)`** для embed_tokens (большой) — пишет в F16
+    ///   Metal буфер напрямую (×2 экономия vs F32 dequantize → to_dtype).
+    /// - **CPU dequant + to_device** для RMS norm weights (маленькие) — обходит
+    ///   Metal blit pipeline, 1 буфер вместо 3.
+    /// - **`flush_buffers()` после каждого слоя** — освобождает intermediate
+    ///   Metal буферы (intermediate dequantize, blit copies) которые иначе
+    ///   накапливаются в pool. Без этого Q8 0.6B даёт +2972 МБ peak вместо
+    ///   ожидаемых ~700 МБ.
     pub fn new(config: Qwen3Config, weights: Weights<'_>, device: &Device) -> Result<Self> {
         let target_dtype = if device.is_metal() || device.is_cuda() {
             DType::BF16
@@ -45,7 +63,9 @@ impl Qwen3Decoder {
             DType::F32
         };
 
-        // embed_tokens.weight
+        // embed_tokens.weight — самый большой тензор (vocab_size × hidden_size).
+        // Для Qwen3-ASR-0.6B: 151936 × 1024 = 156М весов.
+        // F32 dequantize = 622 МБ, F16 dequantize = 311 МБ — ×2 экономия пикового.
         let embed_weight = match &weights {
             Weights::Standard(vb) => vb
                 .pp("embed_tokens")
@@ -53,7 +73,7 @@ impl Qwen3Decoder {
             Weights::Quantized(vb) => vb
                 .pp("embed_tokens")
                 .get((config.vocab_size, config.hidden_size), "weight")?
-                .dequantize(device)?,
+                .dequantize_f16(device)?,
         };
 
         let embed_weight = if embed_weight.dtype() != target_dtype {
@@ -61,6 +81,7 @@ impl Qwen3Decoder {
         } else {
             embed_weight
         };
+        flush_metal_pool_silent(device);
 
         let embed_tokens = Embedding::new(embed_weight.clone(), config.hidden_size);
 
@@ -78,14 +99,24 @@ impl Qwen3Decoder {
             let layer =
                 DecoderLayer::new(&config, weights.pp(format!("layers.{}", i)), rope.clone())?;
             layers.push(layer);
+            // Periodic flush — освобождает intermediate dequantize/blit буферы
+            // которые иначе аккумулируются в Metal pool (×3-4 от размера весов).
+            if (i + 1) % 4 == 0 {
+                flush_metal_pool_silent(device);
+            }
         }
+        flush_metal_pool_silent(device);
 
         let norm = match weights.pp("norm") {
             Weights::Standard(vb) => RmsNorm::new(config.hidden_size, config.rms_norm_eps, vb)?,
             Weights::Quantized(vb) => {
+                // RMS norm — маленький (hidden_size = 1024), dequantize на CPU
+                // и to_device(Metal) даёт 1 буфер вместо blit pipeline overhead
+                // (см. Yttri rms_norm_cpu в quantized_qwen35.rs).
                 let mut w = vb
                     .get((config.hidden_size,), "weight")?
-                    .dequantize(device)?;
+                    .dequantize(&Device::Cpu)?
+                    .to_device(device)?;
                 if w.dtype() != target_dtype {
                     w = w.to_dtype(target_dtype)?;
                 }

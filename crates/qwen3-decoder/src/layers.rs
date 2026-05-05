@@ -190,11 +190,15 @@ impl Attention {
             Weights::Standard(vb) => RmsNorm::new(head_dim, config.rms_norm_eps, vb)?,
             Weights::Quantized(vb) => {
                 let target_dtype = if vb.device().is_metal() || vb.device().is_cuda() {
-                    DType::BF16
+                    DType::F16
                 } else {
                     DType::F32
                 };
-                let mut w = vb.get((head_dim,), "weight")?.dequantize(vb.device())?;
+                // RMS norm — маленький, CPU dequant + to_device избегает Metal blit overhead.
+                let mut w = vb
+                    .get((head_dim,), "weight")?
+                    .dequantize(&candle_core::Device::Cpu)?
+                    .to_device(vb.device())?;
                 if w.dtype() != target_dtype {
                     w = w.to_dtype(target_dtype)?;
                 }
@@ -205,11 +209,15 @@ impl Attention {
             Weights::Standard(vb) => RmsNorm::new(head_dim, config.rms_norm_eps, vb)?,
             Weights::Quantized(vb) => {
                 let target_dtype = if vb.device().is_metal() || vb.device().is_cuda() {
-                    DType::BF16
+                    DType::F16
                 } else {
                     DType::F32
                 };
-                let mut w = vb.get((head_dim,), "weight")?.dequantize(vb.device())?;
+                // RMS norm — маленький, CPU dequant + to_device избегает Metal blit overhead.
+                let mut w = vb
+                    .get((head_dim,), "weight")?
+                    .dequantize(&candle_core::Device::Cpu)?
+                    .to_device(vb.device())?;
                 if w.dtype() != target_dtype {
                     w = w.to_dtype(target_dtype)?;
                 }
@@ -424,13 +432,14 @@ impl DecoderLayer {
             Weights::Standard(vb) => RmsNorm::new(config.hidden_size, config.rms_norm_eps, vb)?,
             Weights::Quantized(vb) => {
                 let target_dtype = if vb.device().is_metal() || vb.device().is_cuda() {
-                    DType::BF16
+                    DType::F16
                 } else {
                     DType::F32
                 };
                 let mut w = vb
                     .get((config.hidden_size,), "weight")?
-                    .dequantize(vb.device())?;
+                    .dequantize(&candle_core::Device::Cpu)?
+                    .to_device(vb.device())?;
                 if w.dtype() != target_dtype {
                     w = w.to_dtype(target_dtype)?;
                 }
@@ -441,13 +450,14 @@ impl DecoderLayer {
             Weights::Standard(vb) => RmsNorm::new(config.hidden_size, config.rms_norm_eps, vb)?,
             Weights::Quantized(vb) => {
                 let target_dtype = if vb.device().is_metal() || vb.device().is_cuda() {
-                    DType::BF16
+                    DType::F16
                 } else {
                     DType::F32
                 };
                 let mut w = vb
                     .get((config.hidden_size,), "weight")?
-                    .dequantize(vb.device())?;
+                    .dequantize(&candle_core::Device::Cpu)?
+                    .to_device(vb.device())?;
                 if w.dtype() != target_dtype {
                     w = w.to_dtype(target_dtype)?;
                 }
