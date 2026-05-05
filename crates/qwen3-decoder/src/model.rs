@@ -170,10 +170,27 @@ impl Qwen3Decoder {
     ) -> Result<Self> {
         use candle_core::quantized::gguf_file;
         let path = path.as_ref();
-        let mut file = std::fs::File::open(path)
-            .map_err(|e| candle_core::Error::Msg(format!("open GGUF {:?}: {}", path, e)))?;
-        let content = gguf_file::Content::read(&mut file)?;
-        let model = LlamaCppQwen3::from_gguf(content, &mut file, device)?;
+        // Phase 7.D #6: zero-copy для Metal (NoCopy buffer на mmap).
+        // На fail или non-Metal — fallback к legacy file reader path.
+        let model = if device.is_metal() {
+            match LlamaCppQwen3::from_gguf_zero_copy(path, device) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!(
+                        "[qwen3-decoder] LlamaCppQwen3::from_gguf_zero_copy failed, fallback to legacy: {e}"
+                    );
+                    let mut file = std::fs::File::open(path)
+                        .map_err(|e| candle_core::Error::Msg(format!("open GGUF {:?}: {}", path, e)))?;
+                    let content = gguf_file::Content::read(&mut file)?;
+                    LlamaCppQwen3::from_gguf(content, &mut file, device)?
+                }
+            }
+        } else {
+            let mut file = std::fs::File::open(path)
+                .map_err(|e| candle_core::Error::Msg(format!("open GGUF {:?}: {}", path, e)))?;
+            let content = gguf_file::Content::read(&mut file)?;
+            LlamaCppQwen3::from_gguf(content, &mut file, device)?
+        };
         // Кэшируем embed_tokens — get_embed_tokens() возвращает &Embedding,
         // поэтому нужно держать копию вне Mutex.
         let embed_cached = model.embed_tokens().clone();
