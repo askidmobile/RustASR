@@ -56,10 +56,10 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 # ML / Tensor backend — askidmobile candle-fork 0.9.2 (общий с Yttri).
 # Содержит Metal patches: compute_per_buffer=15, sync per layer, native dequantize_f16.
 # См. [patch] секцию ниже — резолвится в локальный ../candle-fork/.
-candle-core = { git = "https://github.com/askidmobile/candle.git", branch = "main", features = ["metal"] }
-candle-nn = { git = "https://github.com/askidmobile/candle.git", branch = "main", features = ["metal"] }
-candle-transformers = { git = "https://github.com/askidmobile/candle.git", branch = "main", features = ["metal"] }
-candle-metal-kernels = { git = "https://github.com/askidmobile/candle.git", branch = "main" }
+candle-core = { git = "https://github.com/askidmobile/candle.git", branch = "master", features = ["metal"] }
+candle-nn = { git = "https://github.com/askidmobile/candle.git", branch = "master", features = ["metal"] }
+candle-transformers = { git = "https://github.com/askidmobile/candle.git", branch = "master", features = ["metal"] }
+candle-metal-kernels = { git = "https://github.com/askidmobile/candle.git", branch = "master" }
 safetensors = "0.5"
 
 # Tokenization
