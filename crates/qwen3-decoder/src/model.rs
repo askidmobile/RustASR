@@ -172,6 +172,8 @@ impl Qwen3Decoder {
         let path = path.as_ref();
         // Phase 7.D #6: zero-copy для Metal (NoCopy buffer на mmap).
         // На fail или non-Metal — fallback к legacy file reader path.
+        // T-283: zero_copy gated by metal feature; на Windows/CUDA сразу legacy.
+        #[cfg(feature = "metal")]
         let model = if device.is_metal() {
             match LlamaCppQwen3::from_gguf_zero_copy(path, device) {
                 Ok(m) => m,
@@ -186,6 +188,13 @@ impl Qwen3Decoder {
                 }
             }
         } else {
+            let mut file = std::fs::File::open(path)
+                .map_err(|e| candle_core::Error::Msg(format!("open GGUF {:?}: {}", path, e)))?;
+            let content = gguf_file::Content::read(&mut file)?;
+            LlamaCppQwen3::from_gguf(content, &mut file, device)?
+        };
+        #[cfg(not(feature = "metal"))]
+        let model = {
             let mut file = std::fs::File::open(path)
                 .map_err(|e| candle_core::Error::Msg(format!("open GGUF {:?}: {}", path, e)))?;
             let content = gguf_file::Content::read(&mut file)?;
@@ -258,10 +267,9 @@ impl Qwen3Decoder {
     ///
     /// На non-Metal device fallback к legacy `from_gguf`.
     pub fn from_gguf(config: Qwen3Config, path: impl AsRef<Path>, device: &Device) -> Result<Self> {
+        // T-283: zero_copy gated by metal feature; на Windows/CUDA сразу legacy.
+        #[cfg(feature = "metal")]
         let vb = if device.is_metal() {
-            // Zero-copy: mmap → Metal NoCopy buffer → sub-views для каждого tensor.
-            // Это direct-GPU pattern что Yttri Local LLM использует (см. quantized_qwen35.rs).
-            // На fail (file size не page-aligned, etc) fallback к legacy.
             match quantized_vb::VarBuilder::from_gguf_mmap_zero_copy(path.as_ref(), device) {
                 Ok(vb) => vb,
                 Err(e) => {
@@ -274,6 +282,8 @@ impl Qwen3Decoder {
         } else {
             quantized_vb::VarBuilder::from_gguf(path.as_ref(), device)?
         };
+        #[cfg(not(feature = "metal"))]
+        let vb = quantized_vb::VarBuilder::from_gguf(path.as_ref(), device)?;
         Self::new(config, Weights::Quantized(vb.pp("thinker.model")), device)
     }
 
