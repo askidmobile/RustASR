@@ -173,7 +173,7 @@ impl Qwen3Decoder {
         // Phase 7.D #6: zero-copy для Metal (NoCopy buffer на mmap).
         // На fail или non-Metal — fallback к legacy file reader path.
         // T-283: zero_copy gated by metal feature; на Windows/CUDA сразу legacy.
-        #[cfg(feature = "metal")]
+        #[cfg(target_os = "macos")]
         let model = if device.is_metal() {
             match LlamaCppQwen3::from_gguf_zero_copy(path, device) {
                 Ok(m) => m,
@@ -193,7 +193,7 @@ impl Qwen3Decoder {
             let content = gguf_file::Content::read(&mut file)?;
             LlamaCppQwen3::from_gguf(content, &mut file, device)?
         };
-        #[cfg(not(feature = "metal"))]
+        #[cfg(not(target_os = "macos"))]
         let model = {
             let mut file = std::fs::File::open(path)
                 .map_err(|e| candle_core::Error::Msg(format!("open GGUF {:?}: {}", path, e)))?;
@@ -268,7 +268,7 @@ impl Qwen3Decoder {
     /// На non-Metal device fallback к legacy `from_gguf`.
     pub fn from_gguf(config: Qwen3Config, path: impl AsRef<Path>, device: &Device) -> Result<Self> {
         // T-283: zero_copy gated by metal feature; на Windows/CUDA сразу legacy.
-        #[cfg(feature = "metal")]
+        #[cfg(target_os = "macos")]
         let vb = if device.is_metal() {
             match quantized_vb::VarBuilder::from_gguf_mmap_zero_copy(path.as_ref(), device) {
                 Ok(vb) => vb,
@@ -282,7 +282,7 @@ impl Qwen3Decoder {
         } else {
             quantized_vb::VarBuilder::from_gguf(path.as_ref(), device)?
         };
-        #[cfg(not(feature = "metal"))]
+        #[cfg(not(target_os = "macos"))]
         let vb = quantized_vb::VarBuilder::from_gguf(path.as_ref(), device)?;
         Self::new(config, Weights::Quantized(vb.pp("thinker.model")), device)
     }

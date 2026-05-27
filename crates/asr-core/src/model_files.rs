@@ -12,6 +12,8 @@ pub const GGUF_DECODER_CANDIDATES: &[&str] = &[
     "model-q8_0.gguf",
     "model-q6k.gguf",
     "model-q6_k.gguf",
+    "model-q4_k_m.gguf",
+    "model-q5_k_m.gguf",
     "model-q4_0.gguf",
     "model.gguf",
 ];
