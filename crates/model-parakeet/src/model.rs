@@ -41,7 +41,7 @@ pub struct ParakeetModel {
 /// Обёртка SentencePiece токенизатора.
 struct SentencePieceTokenizer {
     /// Массив кусочков (pieces): index → string.
-    vocab: Vec<String>,
+    pub(crate) vocab: Vec<String>,
 }
 
 impl SentencePieceTokenizer {
@@ -119,8 +119,10 @@ impl ParakeetModel {
             )));
         }
 
-        // Для Metal: используем F32 (BF16 не поддерживается для всех операций)
-        let dtype = if device.is_cuda() {
+        // F16 на Metal (нативная поддержка), BF16 на CUDA, F32 на CPU
+        let dtype = if device.is_metal() {
+            DType::F16
+        } else if device.is_cuda() {
             DType::BF16
         } else {
             DType::F32
@@ -205,43 +207,62 @@ impl ParakeetModel {
         })
     }
 
-    /// Транскрибация одного чанка аудио.
-    fn transcribe_chunk(&self, samples: &[f32]) -> AsrResult<String> {
-        // 1. Mel-спектрограмма: [1, n_mels, T]
+    /// Encode audio → encoder frames.
+    fn encode_chunk(&self, samples: &[f32]) -> AsrResult<candle_core::Tensor> {
         let mel = self.mel_extractor.extract(samples, &self.device)?;
-        let mel_flat = mel.flatten_all()?;
-        debug!(
-            "Mel-спектрограмма: {:?}, min={:.3}, max={:.3}, mean={:.3}",
-            mel.shape(),
-            mel_flat.min(0)?.to_scalar::<f32>().unwrap_or(f32::NAN),
-            mel_flat.max(0)?.to_scalar::<f32>().unwrap_or(f32::NAN),
-            mel_flat.mean_all()?.to_scalar::<f32>().unwrap_or(f32::NAN),
-        );
-
-        // 2. Encoder: [1, n_mels, T] → [1, T/8, d_model]
+        debug!("Mel-спектрограмма: {:?}", mel.shape());
         let encoder_output = self.encoder.forward(&mel)?;
-        let enc_flat = encoder_output.flatten_all()?;
-        debug!(
-            "Encoder output: {:?}, min={:.3}, max={:.3}, mean={:.3}",
-            encoder_output.shape(),
-            enc_flat.min(0)?.to_scalar::<f32>().unwrap_or(f32::NAN),
-            enc_flat.max(0)?.to_scalar::<f32>().unwrap_or(f32::NAN),
-            enc_flat.mean_all()?.to_scalar::<f32>().unwrap_or(f32::NAN),
-        );
+        debug!("Encoder output: {:?}", encoder_output.shape());
+        encoder_output
+            .squeeze(0)
+            .map_err(|e| AsrError::Inference(e.to_string()))
+    }
 
-        // 3. Squeeze batch dim: [T/8, d_model]
-        let encoder_output = encoder_output.squeeze(0)?;
-
-        // 4. TDT greedy decode
+    /// Транскрибация одного чанка аудио.
+    fn transcribe_chunk(&self, samples: &[f32]) -> AsrResult<(String, Vec<(u32, u64)>)> {
+        let encoder_output = self.encode_chunk(samples)?;
         let result = self
             .tdt_decoder
-            .decode(&encoder_output, &self.prediction_net, &self.joint)?;
-
-        // 5. Detokenize
+            .decode(&encoder_output, &self.prediction_net, &self.joint)
+            .map_err(|e| AsrError::Inference(e.to_string()))?;
         let text = self.tokenizer.decode(&result.tokens);
         debug!("Transcript ({}): {}", result.tokens.len(), &text);
+        Ok((text, result.timestamps))
+    }
 
-        Ok(text)
+    /// Streaming транскрибация чанка: callback на каждый non-blank токен.
+    fn transcribe_chunk_streaming(
+        &self,
+        samples: &[f32],
+        callback: &dyn Fn(u32, u64),
+    ) -> AsrResult<(String, Vec<(u32, u64)>)> {
+        let encoder_output = self.encode_chunk(samples)?;
+        let result = self
+            .tdt_decoder
+            .decode_streaming(
+                &encoder_output,
+                &self.prediction_net,
+                &self.joint,
+                callback,
+            )
+            .map_err(|e| AsrError::Inference(e.to_string()))?;
+        let text = self.tokenizer.decode(&result.tokens);
+        Ok((text, result.timestamps))
+    }
+
+    /// Проверяет word boundary по SentencePiece ▁ prefix.
+    fn is_word_boundary(&self, token_id: u32) -> bool {
+        let idx = token_id as usize;
+        if idx < self.tokenizer.vocab.len() {
+            self.tokenizer.vocab[idx].starts_with('▁')
+        } else {
+            false
+        }
+    }
+
+    /// Декодирует один token ID в строку.
+    fn decode_token(&self, token_id: u32) -> String {
+        self.tokenizer.decode(&[token_id])
     }
 }
 
@@ -307,30 +328,30 @@ impl AsrModel for ParakeetModel {
             samples.len()
         );
 
-        // Чанкование для длинного аудио
         let chunk_samples = (CHUNK_DURATION_SECS * self.config.sample_rate as f64) as usize;
-        let text = if samples.len() <= chunk_samples {
+        let (text, all_timestamps) = if samples.len() <= chunk_samples {
             self.transcribe_chunk(samples)?
         } else {
             let mut parts = Vec::new();
+            let mut all_ts = Vec::new();
             let mut offset = 0;
             while offset < samples.len() {
                 let end = (offset + chunk_samples).min(samples.len());
                 let chunk = &samples[offset..end];
-                let chunk_text = self.transcribe_chunk(chunk)?;
+                let (chunk_text, ts) = self.transcribe_chunk(chunk)?;
+                let offset_ms = (offset as u64 * 1000) / self.config.sample_rate as u64;
+                for (tok, ms) in &ts {
+                    all_ts.push((*tok, ms + offset_ms));
+                }
                 if !chunk_text.is_empty() {
                     parts.push(chunk_text);
                 }
                 offset = end;
-                debug!(
-                    "Чанк {}/{}: {:.1}с",
-                    parts.len(),
-                    samples.len().div_ceil(chunk_samples),
-                    chunk.len() as f64 / self.config.sample_rate as f64
-                );
             }
-            parts.join(" ")
+            (parts.join(" "), all_ts)
         };
+
+        let segments = self.timestamps_to_segments(&all_timestamps);
 
         let inference_time = start.elapsed().as_secs_f64();
         let rtf = if audio_duration > 0.0 {
@@ -350,8 +371,130 @@ impl AsrModel for ParakeetModel {
             audio_duration_secs: audio_duration,
             rtf,
             model_name: self.config.model_name.clone(),
-            segments: vec![],
+            segments,
             language: None,
         })
+    }
+}
+
+impl ParakeetModel {
+    /// Streaming транскрибация: callback(text, is_word_boundary, timestamp_ms).
+    pub fn transcribe_streaming(
+        &mut self,
+        samples: &[f32],
+        _options: &TranscribeOptions,
+        word_callback: impl Fn(&str, bool, u64),
+    ) -> AsrResult<TranscriptionResult> {
+        let start = Instant::now();
+        let audio_duration = samples.len() as f64 / self.config.sample_rate as f64;
+
+        info!(
+            "Parakeet streaming transcribe: {:.1}с аудио ({} сэмплов)",
+            audio_duration,
+            samples.len()
+        );
+
+        let callback = |token_id: u32, ts_ms: u64| {
+            let text = self.decode_token(token_id);
+            let is_wb = self.is_word_boundary(token_id);
+            if !text.trim().is_empty() {
+                word_callback(&text, is_wb, ts_ms);
+            }
+        };
+
+        let chunk_samples = (CHUNK_DURATION_SECS * self.config.sample_rate as f64) as usize;
+        let (text, all_timestamps) = if samples.len() <= chunk_samples {
+            self.transcribe_chunk_streaming(samples, &callback)?
+        } else {
+            let mut parts = Vec::new();
+            let mut all_ts = Vec::new();
+            let mut offset = 0;
+            while offset < samples.len() {
+                let end = (offset + chunk_samples).min(samples.len());
+                let chunk = &samples[offset..end];
+                let (chunk_text, ts) = self.transcribe_chunk_streaming(chunk, &callback)?;
+                let offset_ms = (offset as u64 * 1000) / self.config.sample_rate as u64;
+                for (tok, ms) in &ts {
+                    all_ts.push((*tok, ms + offset_ms));
+                }
+                if !chunk_text.is_empty() {
+                    parts.push(chunk_text);
+                }
+                offset = end;
+            }
+            (parts.join(" "), all_ts)
+        };
+
+        let segments = self.timestamps_to_segments(&all_timestamps);
+
+        let inference_time = start.elapsed().as_secs_f64();
+        let rtf = if audio_duration > 0.0 {
+            inference_time / audio_duration
+        } else {
+            0.0
+        };
+
+        debug!(
+            "Parakeet streaming: {:.1}с инференса, RTF={:.3}",
+            inference_time, rtf,
+        );
+
+        Ok(TranscriptionResult {
+            text,
+            inference_time_secs: inference_time,
+            audio_duration_secs: audio_duration,
+            rtf,
+            model_name: self.config.model_name.clone(),
+            segments,
+            language: None,
+        })
+    }
+
+    /// Конвертация raw token timestamps в word-level Segments.
+    fn timestamps_to_segments(
+        &self,
+        timestamps: &[(u32, u64)],
+    ) -> Vec<asr_core::Segment> {
+        use asr_core::Segment;
+        let mut segments = Vec::new();
+        let mut word_tokens: Vec<u32> = Vec::new();
+        let mut word_start_ms: u64 = 0;
+
+        for &(tok, ts_ms) in timestamps {
+            let is_wb = self.is_word_boundary(tok);
+            if is_wb && !word_tokens.is_empty() {
+                let text = self.tokenizer.decode(&word_tokens);
+                let text = text.trim().to_string();
+                if !text.is_empty() {
+                    segments.push(Segment {
+                        start: word_start_ms as f64 / 1000.0,
+                        end: ts_ms as f64 / 1000.0,
+                        text,
+                        confidence: None,
+                    });
+                }
+                word_tokens.clear();
+            }
+            if word_tokens.is_empty() {
+                word_start_ms = ts_ms;
+            }
+            word_tokens.push(tok);
+        }
+
+        if !word_tokens.is_empty() {
+            let text = self.tokenizer.decode(&word_tokens);
+            let text = text.trim().to_string();
+            let end_ms = timestamps.last().map(|(_, ms)| *ms + 80).unwrap_or(word_start_ms);
+            if !text.is_empty() {
+                segments.push(Segment {
+                    start: word_start_ms as f64 / 1000.0,
+                    end: end_ms as f64 / 1000.0,
+                    text,
+                    confidence: None,
+                });
+            }
+        }
+
+        segments
     }
 }
