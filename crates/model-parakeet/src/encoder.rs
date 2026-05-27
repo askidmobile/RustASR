@@ -195,11 +195,12 @@ impl DwStridingSubsampling {
         // Stage 0: Conv2d(1→C, 3×3, stride=2, pad=1) + ReLU
         let x = conv2d_manual(x, &self.conv0_w, Some(&self.conv0_b), 2, 1, 1)?;
         let x = x.relu()?;
-        debug!(
-            "  After stage0: {:?}, [{:.4}, {:.4}]",
+        let s0 = x.flatten_all()?;
+        eprintln!(
+            "[sub-debug] stage0: {:?}, range=[{:.2}, {:.2}]",
             x.shape(),
-            x.flatten_all()?.min(0)?.to_scalar::<f32>().unwrap_or(0.0),
-            x.flatten_all()?.max(0)?.to_scalar::<f32>().unwrap_or(0.0),
+            s0.min(0)?.to_scalar::<f32>().unwrap_or(0.0),
+            s0.max(0)?.to_scalar::<f32>().unwrap_or(0.0),
         );
 
         // Stage 1: Depthwise Conv2d(C, 3×3, groups=C, stride=2, pad=1)
@@ -207,28 +208,37 @@ impl DwStridingSubsampling {
         // Pointwise Conv2d(C→C, 1×1)
         let x = conv2d_manual(&x, &self.conv3_w, Some(&self.conv3_b), 1, 0, 1)?;
         let x = x.relu()?;
-        debug!(
-            "  After stage1: {:?}, [{:.4}, {:.4}]",
+        let s1 = x.flatten_all()?;
+        eprintln!(
+            "[sub-debug] stage1: {:?}, range=[{:.2}, {:.2}]",
             x.shape(),
-            x.flatten_all()?.min(0)?.to_scalar::<f32>().unwrap_or(0.0),
-            x.flatten_all()?.max(0)?.to_scalar::<f32>().unwrap_or(0.0),
+            s1.min(0)?.to_scalar::<f32>().unwrap_or(0.0),
+            s1.max(0)?.to_scalar::<f32>().unwrap_or(0.0),
         );
 
         // Stage 2: Depthwise Conv2d(C, 3×3, groups=C, stride=2, pad=1)
         let x = conv2d_manual(&x, &self.conv5_w, Some(&self.conv5_b), 2, 1, self.channels)?;
-        // Pointwise Conv2d(C→C, 1×1)
-        let x = conv2d_manual(&x, &self.conv6_w, Some(&self.conv6_b), 1, 0, 1)?;
-        debug!(
-            "  After stage2: {:?}, [{:.4}, {:.4}]",
+        let s2dw = x.flatten_all()?;
+        eprintln!(
+            "[sub-debug] stage2_dw: {:?}, range=[{:.2}, {:.2}]",
             x.shape(),
-            x.flatten_all()?.min(0)?.to_scalar::<f32>().unwrap_or(0.0),
-            x.flatten_all()?.max(0)?.to_scalar::<f32>().unwrap_or(0.0),
+            s2dw.min(0)?.to_scalar::<f32>().unwrap_or(0.0),
+            s2dw.max(0)?.to_scalar::<f32>().unwrap_or(0.0),
         );
+        // Pointwise Conv2d(C→C, 1×1) + ReLU (conv[7] в NeMo)
+        let x = conv2d_manual(&x, &self.conv6_w, Some(&self.conv6_b), 1, 0, 1)?;
+        let x = x.relu()?;
 
-        // x: [B, C, T/8, D/8] (convention: dim2=time, dim3=freq)
-        let (b, _c, time, _freq) = x.dims4()?;
-        // Transpose + flatten: [B, C, T, D] → [B, T, C, D] → [B, T, C*D]
-        let x = x.permute((0, 2, 1, 3))?; // [B, T, C, F]
+        // x: [B, C, D/8, T/8] — NeMo convention: dim2=freq, dim3=time
+        let (b, _c, _freq, time) = x.dims4()?;
+        // NeMo reshape: x.transpose(1, 2).reshape(b, t, -1)
+        // transpose(1,2): [B, C, F, T] → [B, F, C, T]
+        // Но NeMo имеет в виду transpose(1,2) на [B, C, T, F] = transpose time/channel.
+        // Фактически NeMo: [B, C, D/8, T/8] → transpose(1,2) → [B, D/8, C, T/8] → reshape(b, t, -1)
+        // Нет! NeMo transpose(1,2): [B, C, T_sub, F_sub] → [B, T_sub, C, F_sub]
+        // В NeMo: dim2=D/8=16, dim3=T/8=63 → transpose → [B, T/8, C, D/8] → flatten → [B, T/8, C*D/8]
+        // Правильно: [B, C, F_sub, T_sub] → permute(0, 3, 1, 2) → [B, T_sub, C, F_sub]
+        let x = x.permute((0, 3, 1, 2))?; // [B, T, C, F]
         let x = x.contiguous()?.reshape((b, time, ()))?;
         debug!(
             "  Pre-proj: {:?}, [{:.4}, {:.4}]",
@@ -598,24 +608,43 @@ impl ConformerLayer {
 
     /// Forward: x [B, T, D], pos_emb [1, 2T-1, D] → [B, T, D]
     fn forward(&self, x: &Tensor, pos_emb: &Tensor) -> Result<Tensor> {
+        let debug_layer = std::env::var("PARAKEET_DEBUG_LAYER").is_ok();
+
         // 1. FFN₁ (×0.5)
         let residual = x;
-        let x = (residual + (self.ff1.forward(&self.norm_ff1.forward(x)?)? * 0.5)?)?;
+        let ff1_out = self.ff1.forward(&self.norm_ff1.forward(x)?)?;
+        if debug_layer {
+            let f = ff1_out.flatten_all()?;
+            eprintln!("[layer-debug] ff1: [{:.2}, {:.2}]", f.min(0)?.to_scalar::<f32>()?, f.max(0)?.to_scalar::<f32>()?);
+        }
+        let x = (residual + (ff1_out * 0.5)?)?;
 
         // 2. Self-Attention
         let residual = &x;
-        let x = (residual
-            + self
-                .self_attn
-                .forward(&self.norm_attn.forward(&x)?, pos_emb)?)?;
+        let attn_out = self.self_attn.forward(&self.norm_attn.forward(&x)?, pos_emb)?;
+        if debug_layer {
+            let f = attn_out.flatten_all()?;
+            eprintln!("[layer-debug] attn: [{:.2}, {:.2}]", f.min(0)?.to_scalar::<f32>()?, f.max(0)?.to_scalar::<f32>()?);
+        }
+        let x = (residual + attn_out)?;
 
         // 3. Convolution
         let residual = &x;
-        let x = (residual + self.conv.forward(&self.norm_conv.forward(&x)?)?)?;
+        let conv_out = self.conv.forward(&self.norm_conv.forward(&x)?)?;
+        if debug_layer {
+            let f = conv_out.flatten_all()?;
+            eprintln!("[layer-debug] conv: [{:.2}, {:.2}]", f.min(0)?.to_scalar::<f32>()?, f.max(0)?.to_scalar::<f32>()?);
+        }
+        let x = (residual + conv_out)?;
 
         // 4. FFN₂ (×0.5)
         let residual = &x;
-        let x = (residual + (self.ff2.forward(&self.norm_ff2.forward(&x)?)? * 0.5)?)?;
+        let ff2_out = self.ff2.forward(&self.norm_ff2.forward(&x)?)?;
+        if debug_layer {
+            let f = ff2_out.flatten_all()?;
+            eprintln!("[layer-debug] ff2: [{:.2}, {:.2}]", f.min(0)?.to_scalar::<f32>()?, f.max(0)?.to_scalar::<f32>()?);
+        }
+        let x = (residual + (ff2_out * 0.5)?)?;
 
         // 5. Final LayerNorm
         self.norm_out.forward(&x)
@@ -659,17 +688,18 @@ impl FastConformerEncoder {
 
     /// Forward: mel [1, n_mels, time] → encoder_output [1, T/8, d_model].
     pub fn forward(&self, mel: &Tensor) -> Result<Tensor> {
-        // NeMo convention: mel [B, D, T] → transpose → [B, T, D] → unsqueeze → [B, 1, T, D]
-        // Это важно: Conv2d обрабатывает dim2 как time, dim3 как freq
-        let x = mel.permute((0, 2, 1))?.unsqueeze(1)?; // [B, 1, T, D]
+        // NeMo convention: mel [B, D, T], unsqueeze → [B, 1, D, T]
+        // Conv2d: dim2=freq(D), dim3=time(T). НЕ транспонировать!
+        let x = mel.unsqueeze(1)?; // [B, 1, D, T]
 
         // Subsampling: [B, 1, T, D] → [B, T/8, d_model]
         let x = self.subsampling.forward(&x)?;
-        debug!(
-            "Subsampling output: {:?}, [{:.4}, {:.4}]",
+        let sub_flat = x.flatten_all()?;
+        eprintln!(
+            "[enc-debug] subsampling: {:?}, range=[{:.2}, {:.2}]",
             x.shape(),
-            x.flatten_all()?.min(0)?.to_scalar::<f32>().unwrap_or(0.0),
-            x.flatten_all()?.max(0)?.to_scalar::<f32>().unwrap_or(0.0),
+            sub_flat.min(0)?.to_scalar::<f32>().unwrap_or(0.0),
+            sub_flat.max(0)?.to_scalar::<f32>().unwrap_or(0.0),
         );
 
         // Positional encoding: масштабирование + PE
@@ -684,12 +714,15 @@ impl FastConformerEncoder {
         );
         for (i, layer) in self.layers.iter().enumerate() {
             x = layer.forward(&x, &pos_emb)?;
-            debug!(
-                "  Layer {}: [{:.4}, {:.4}]",
-                i,
-                x.flatten_all()?.min(0)?.to_scalar::<f32>().unwrap_or(0.0),
-                x.flatten_all()?.max(0)?.to_scalar::<f32>().unwrap_or(0.0),
-            );
+            if i < 3 || i == self.layers.len() - 1 {
+                let lf = x.flatten_all()?;
+                eprintln!(
+                    "[enc-debug] layer {}: range=[{:.6}, {:.6}]",
+                    i,
+                    lf.min(0)?.to_scalar::<f32>().unwrap_or(0.0),
+                    lf.max(0)?.to_scalar::<f32>().unwrap_or(0.0),
+                );
+            }
         }
 
         Ok(x)

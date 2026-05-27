@@ -179,14 +179,9 @@ impl PredictionNet {
     pub fn step(&self, token_id: u32, state: &LstmState) -> Result<(Tensor, LstmState)> {
         let device = self.embedding.device();
 
-        // Embedding lookup
-        let embed = if (token_id as usize) == self.blank_idx {
-            // Для blank используем нулевой вектор (как при инициализации)
-            Tensor::zeros(self.embedding.dim(1)?, DType::F32, device)?
-        } else {
-            let idx = Tensor::new(&[token_id], device)?;
-            self.embedding.embedding(&idx)?.squeeze(0)?
-        };
+        // Embedding lookup (включая blank — у него свой выученный вектор)
+        let idx = Tensor::new(&[token_id], device)?;
+        let embed = self.embedding.embedding(&idx)?.squeeze(0)?;
 
         // Прогнать через LSTM слои
         let mut x = embed;

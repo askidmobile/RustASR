@@ -78,7 +78,7 @@ impl TdtGreedyDecoder {
         let t_total = encoder_output.dim(0)?;
         let device = encoder_output.device();
 
-        debug!("TDT decode: {} фреймов энкодера", t_total);
+        eprintln!("[tdt-debug] TDT decode: {} фреймов энкодера, blank_idx={}", t_total, self.blank_idx);
 
         let mut hypothesis: Vec<u32> = Vec::new();
         let mut timestamps: Vec<(u32, u64)> = Vec::new();
@@ -96,7 +96,7 @@ impl TdtGreedyDecoder {
             let k = token_logits.argmax(D::Minus1)?.to_scalar::<u32>()?;
             let dur_idx = dur_logits.argmax(D::Minus1)?.to_scalar::<u32>()? as usize;
 
-            if step_count < 5 {
+            if step_count < 10 {
                 let blank_score = token_logits.i(self.blank_idx)?.to_scalar::<f32>()?;
                 let logits_vec: Vec<f32> = token_logits.to_vec1()?;
                 let mut indexed: Vec<(usize, f32)> =
@@ -106,8 +106,8 @@ impl TdtGreedyDecoder {
                     .iter()
                     .map(|(i, v)| format!("{}:{:.3}", i, v))
                     .collect();
-                debug!(
-                    "TDT step {}: t={}/{}, k={}, dur_idx={}, blank={:.3}, top=[{}]",
+                eprintln!(
+                    "[tdt-debug] step {}: t={}/{}, k={}, dur_idx={}, blank={:.3}, top=[{}]",
                     step_count, time_idx, t_total, k, dur_idx, blank_score,
                     top5.join(", ")
                 );

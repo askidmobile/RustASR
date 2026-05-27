@@ -28,11 +28,11 @@ const CHUNK_DURATION_SECS: f64 = 30.0;
 /// Модель Parakeet-TDT v3.
 pub struct ParakeetModel {
     encoder: FastConformerEncoder,
-    prediction_net: PredictionNet,
-    joint: JointNetwork,
-    tdt_decoder: TdtGreedyDecoder,
+    pub prediction_net: PredictionNet,
+    pub joint: JointNetwork,
+    pub tdt_decoder: TdtGreedyDecoder,
     mel_extractor: ParakeetMelExtractor,
-    tokenizer: SentencePieceTokenizer,
+    pub(crate) tokenizer: SentencePieceTokenizer,
     device: Device,
     config: ParakeetConfig,
     model_dir: PathBuf,
@@ -210,9 +210,7 @@ impl ParakeetModel {
     /// Encode audio → encoder frames.
     fn encode_chunk(&self, samples: &[f32]) -> AsrResult<candle_core::Tensor> {
         let mel = self.mel_extractor.extract(samples, &self.device)?;
-        debug!("Mel-спектрограмма: {:?}", mel.shape());
         let encoder_output = self.encoder.forward(&mel)?;
-        debug!("Encoder output: {:?}", encoder_output.shape());
         encoder_output
             .squeeze(0)
             .map_err(|e| AsrError::Inference(e.to_string()))
@@ -263,6 +261,11 @@ impl ParakeetModel {
     /// Декодирует один token ID в строку.
     fn decode_token(&self, token_id: u32) -> String {
         self.tokenizer.decode(&[token_id])
+    }
+
+    /// Декодирует массив token IDs в текст. Публичный для тестов.
+    pub fn decode_tokens(&self, tokens: &[u32]) -> String {
+        self.tokenizer.decode(tokens)
     }
 }
 

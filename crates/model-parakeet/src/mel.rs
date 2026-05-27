@@ -151,8 +151,8 @@ impl ParakeetMelExtractor {
     fn compute_stft(&self, samples: &[f32]) -> Vec<Vec<f32>> {
         let n_fft_bins = self.n_fft / 2 + 1;
 
-        // Center padding: добавить win_length/2 нулей с обоих сторон
-        let pad = self.win_length / 2;
+        // Center padding: NeMo/torch.stft pad n_fft//2 с каждой стороны
+        let pad = self.n_fft / 2;
         let mut padded = vec![0.0f32; pad];
         padded.extend_from_slice(samples);
         padded.resize(padded.len() + pad, 0.0);
