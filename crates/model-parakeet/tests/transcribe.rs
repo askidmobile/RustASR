@@ -207,7 +207,7 @@ fn test_parakeet_transcribe_30s() {
             let rtf = elapsed.as_secs_f64() / duration;
             eprintln!(
                 "Transcription: \"{}\" ({:.0}ms, RTF={:.3})",
-                &r.text[..r.text.len().min(120)],
+                &r.text[..r.text.char_indices().nth(60).map(|(i,_)| i).unwrap_or(r.text.len())],
                 elapsed.as_millis(),
                 rtf,
             );

@@ -7,7 +7,7 @@
 //! - RelPositionMultiHeadAttention: pos_bias_u/v + rel_shift
 //! - ConformerConvolution: pointwise → GLU → depthwise → BN → SiLU → pointwise
 
-use candle_core::{Device, Module, Result, Tensor};
+use candle_core::{Device, IndexOp, Module, Result, Tensor};
 use candle_nn::VarBuilder;
 use tracing::debug;
 
@@ -229,16 +229,10 @@ impl DwStridingSubsampling {
         let x = conv2d_manual(&x, &self.conv6_w, Some(&self.conv6_b), 1, 0, 1)?;
         let x = x.relu()?;
 
-        // x: [B, C, D/8, T/8] — NeMo convention: dim2=freq, dim3=time
-        let (b, _c, _freq, time) = x.dims4()?;
-        // NeMo reshape: x.transpose(1, 2).reshape(b, t, -1)
-        // transpose(1,2): [B, C, F, T] → [B, F, C, T]
-        // Но NeMo имеет в виду transpose(1,2) на [B, C, T, F] = transpose time/channel.
-        // Фактически NeMo: [B, C, D/8, T/8] → transpose(1,2) → [B, D/8, C, T/8] → reshape(b, t, -1)
-        // Нет! NeMo transpose(1,2): [B, C, T_sub, F_sub] → [B, T_sub, C, F_sub]
-        // В NeMo: dim2=D/8=16, dim3=T/8=63 → transpose → [B, T/8, C, D/8] → flatten → [B, T/8, C*D/8]
-        // Правильно: [B, C, F_sub, T_sub] → permute(0, 3, 1, 2) → [B, T_sub, C, F_sub]
-        let x = x.permute((0, 3, 1, 2))?; // [B, T, C, F]
+        // x: [B, C, T/8, D/8] — dim2=time/8, dim3=freq/8
+        let (b, _c, time, _freq) = x.dims4()?;
+        // NeMo: transpose(1,2) → [B, T/8, C, D/8] → reshape → [B, T/8, C*D/8]
+        let x = x.permute((0, 2, 1, 3))?; // [B, T, C, F]
         let x = x.contiguous()?.reshape((b, time, ()))?;
         debug!(
             "  Pre-proj: {:?}, [{:.4}, {:.4}]",
@@ -688,9 +682,9 @@ impl FastConformerEncoder {
 
     /// Forward: mel [1, n_mels, time] → encoder_output [1, T/8, d_model].
     pub fn forward(&self, mel: &Tensor) -> Result<Tensor> {
-        // NeMo convention: mel [B, D, T], unsqueeze → [B, 1, D, T]
-        // Conv2d: dim2=freq(D), dim3=time(T). НЕ транспонировать!
-        let x = mel.unsqueeze(1)?; // [B, 1, D, T]
+        // NeMo: transpose(1,2) mel [B,D,T] → [B,T,D], потом unsqueeze → [B,1,T,D]
+        // Conv2d: dim2=time(T), dim3=freq(D)
+        let x = mel.permute((0, 2, 1))?.unsqueeze(1)?; // [B, 1, T, D]
 
         // Subsampling: [B, 1, T, D] → [B, T/8, d_model]
         let x = self.subsampling.forward(&x)?;
@@ -701,6 +695,15 @@ impl FastConformerEncoder {
             sub_flat.min(0)?.to_scalar::<f32>().unwrap_or(0.0),
             sub_flat.max(0)?.to_scalar::<f32>().unwrap_or(0.0),
         );
+        // Element-wise debug для сравнения с NeMo
+        if std::env::var("PARAKEET_DEBUG_ELEMENTS").is_ok() {
+            let row0: Vec<f32> = x.i((0, 0, ..))?.to_vec1()?;
+            eprintln!("[enc-debug] sub[0,:8]: {:?}", &row0[..8]);
+            let row1: Vec<f32> = x.i((0, 1, ..))?.to_vec1()?;
+            eprintln!("[enc-debug] sub[1,:8]: {:?}", &row1[..8]);
+            let row30: Vec<f32> = x.i((0, 30, ..))?.to_vec1()?;
+            eprintln!("[enc-debug] sub[30,:8]: {:?}", &row30[..8]);
+        }
 
         // Positional encoding: масштабирование + PE
         let (x, pos_emb) = self.pos_enc.forward(&x)?;
