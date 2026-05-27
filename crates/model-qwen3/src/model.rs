@@ -233,6 +233,65 @@ impl AsrModel for Qwen3AsrModel {
 }
 
 impl Qwen3AsrModel {
+    /// Streaming транскрибация: `word_callback(text, is_word_boundary)` вызывается
+    /// per-token по мере autoregressive генерации.
+    pub fn transcribe_streaming(
+        &mut self,
+        samples: &[f32],
+        options: &TranscribeOptions,
+        word_callback: impl Fn(&str, bool),
+    ) -> AsrResult<TranscriptionResult> {
+        let start = Instant::now();
+        let audio_duration_secs = samples.len() as f64 / self.sample_rate() as f64;
+
+        info!(
+            "Qwen3-ASR streaming transcribe: {:.1}с аудио ({} сэмплов)",
+            audio_duration_secs,
+            samples.len()
+        );
+
+        let max_tokens = options
+            .max_tokens
+            .unwrap_or_else(|| Self::estimate_max_tokens(audio_duration_secs));
+
+        let language = options.language.as_deref();
+
+        let result = self
+            .pipeline
+            .transcribe_streaming(samples, max_tokens, language, word_callback)
+            .map_err(|e| AsrError::Inference(format!("Qwen3-ASR streaming ошибка инференса: {e}")))?;
+
+        let inference_time = start.elapsed().as_secs_f64();
+        let rtf = if audio_duration_secs > 0.0 {
+            inference_time / audio_duration_secs
+        } else {
+            0.0
+        };
+
+        debug!(
+            "Qwen3-ASR streaming: {:.1}с инференса, RTF={:.3}, lang={}, tokens={}, stop={:?}",
+            inference_time, rtf, result.language, result.generated_tokens, result.stop_reason,
+        );
+
+        let detected_language = if result.language.is_empty() {
+            None
+        } else {
+            Some(result.language)
+        };
+
+        Ok(TranscriptionResult {
+            text: result.text,
+            inference_time_secs: inference_time,
+            audio_duration_secs,
+            rtf,
+            model_name: self.model_name.clone(),
+            segments: vec![],
+            language: detected_language,
+        })
+    }
+}
+
+impl Qwen3AsrModel {
     /// Суммарный размер файлов весов.
     fn weights_total_size(&self) -> Option<u64> {
         let mut total = 0u64;

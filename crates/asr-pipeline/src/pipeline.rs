@@ -388,6 +388,16 @@ impl AsrPipeline {
         max_tokens: usize,
         force_language: Option<&str>,
     ) -> Result<(Vec<u32>, StopReason)> {
+        self.transcribe_inner(samples, max_tokens, force_language, None)
+    }
+
+    fn transcribe_inner(
+        &self,
+        samples: &[f32],
+        max_tokens: usize,
+        force_language: Option<&str>,
+        token_callback: Option<&dyn Fn(u32)>,
+    ) -> Result<(Vec<u32>, StopReason)> {
         let debug = asr_core::debug::enabled();
 
         // Special token IDs for Qwen3-ASR
@@ -609,6 +619,10 @@ impl AsrPipeline {
 
             generated_tokens.push(next_token_id);
 
+            if let Some(cb) = &token_callback {
+                cb(next_token_id);
+            }
+
             if Self::looks_like_repetition_loop(&generated_tokens) {
                 stop_reason = StopReason::Repetition;
                 break;
@@ -683,6 +697,46 @@ impl AsrPipeline {
             max_tokens,
             force_language,
         )?;
+        let raw = self.tokenizer.decode(&tokens);
+        let (language, text) = parse_asr_output(&raw, force_language);
+        Ok(AsrTranscription {
+            language,
+            text,
+            raw,
+            generated_tokens: tokens.len(),
+            stop_reason,
+        })
+    }
+
+    /// Streaming транскрибация: callback вызывается per-word по мере генерации.
+    ///
+    /// `word_callback(text, is_word_boundary)` — text декодирован из BPE,
+    /// is_word_boundary=true если токен начинается с пробела (новое слово).
+    pub fn transcribe_streaming(
+        &self,
+        samples: &[f32],
+        max_tokens: usize,
+        force_language: Option<&str>,
+        word_callback: impl Fn(&str, bool),
+    ) -> Result<AsrTranscription> {
+        use std::cell::Cell;
+        let past_asr_tag = Cell::new(false);
+
+        let token_cb = |token_id: u32| {
+            if !past_asr_tag.get() {
+                if token_id == 151704 {
+                    past_asr_tag.set(true);
+                }
+                return;
+            }
+            if let Some(text) = self.tokenizer.decode_token(token_id) {
+                let is_wb = self.tokenizer.is_word_boundary(token_id);
+                word_callback(&text, is_wb);
+            }
+        };
+
+        let (tokens, stop_reason) =
+            self.transcribe_inner(samples, max_tokens, force_language, Some(&token_cb))?;
         let raw = self.tokenizer.decode(&tokens);
         let (language, text) = parse_asr_output(&raw, force_language);
         Ok(AsrTranscription {

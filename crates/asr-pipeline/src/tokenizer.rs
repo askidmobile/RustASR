@@ -134,6 +134,24 @@ impl Tokenizer {
     pub fn token_id(&self, token: &str) -> Option<u32> {
         self.token_to_id.get(token).copied()
     }
+
+    /// Декодирует один токен в строку. Возвращает `None` для special/eos токенов.
+    pub fn decode_token(&self, id: u32) -> Option<String> {
+        if self.eos_token_ids.contains(&id) || self.special_ids.contains(&id) {
+            return None;
+        }
+        let tok = self.id_to_token.get(id as usize)?.as_ref()?;
+        Some(byte_level_decode(tok, &self.byte_decoder))
+    }
+
+    /// Проверяет, начинается ли raw BPE-токен с `Ġ` (GPT-2 маркер пробела = word boundary).
+    pub fn is_word_boundary(&self, id: u32) -> bool {
+        if let Some(Some(tok)) = self.id_to_token.get(id as usize) {
+            tok.starts_with('Ġ')
+        } else {
+            false
+        }
+    }
 }
 
 fn byte_level_decode(s: &str, byte_decoder: &HashMap<char, u8>) -> String {
