@@ -8,6 +8,14 @@
 //! - ConformerConvolution: pointwise → GLU → depthwise → BN → SiLU → pointwise
 
 use candle_core::{Device, IndexOp, Module, Result, Tensor};
+
+/// Освобождение Metal buffer pool — аналог Qwen3-ASR pipeline.
+fn flush_metal_pool(device: &Device) {
+    if device.is_metal() {
+        let _ = device.synchronize();
+        let _ = device.flush_buffers();
+    }
+}
 use candle_nn::VarBuilder;
 use tracing::debug;
 
@@ -133,6 +141,11 @@ struct DwStridingSubsampling {
 }
 
 impl DwStridingSubsampling {
+    /// dtype первого conv weight (для cast'а входов в правильный тип).
+    pub fn weight_dtype(&self) -> candle_core::DType {
+        self.conv0_w.dtype()
+    }
+
     fn load(config: &EncoderConfig, vb: VarBuilder) -> Result<Self> {
         let c = config.subsampling_conv_channels; // 256
 
@@ -195,36 +208,15 @@ impl DwStridingSubsampling {
         // Stage 0: Conv2d(1→C, 3×3, stride=2, pad=1) + ReLU
         let x = conv2d_manual(x, &self.conv0_w, Some(&self.conv0_b), 2, 1, 1)?;
         let x = x.relu()?;
-        let s0 = x.flatten_all()?;
-        eprintln!(
-            "[sub-debug] stage0: {:?}, range=[{:.2}, {:.2}]",
-            x.shape(),
-            s0.min(0)?.to_scalar::<f32>().unwrap_or(0.0),
-            s0.max(0)?.to_scalar::<f32>().unwrap_or(0.0),
-        );
 
         // Stage 1: Depthwise Conv2d(C, 3×3, groups=C, stride=2, pad=1)
         let x = conv2d_manual(&x, &self.conv2_w, Some(&self.conv2_b), 2, 1, self.channels)?;
         // Pointwise Conv2d(C→C, 1×1)
         let x = conv2d_manual(&x, &self.conv3_w, Some(&self.conv3_b), 1, 0, 1)?;
         let x = x.relu()?;
-        let s1 = x.flatten_all()?;
-        eprintln!(
-            "[sub-debug] stage1: {:?}, range=[{:.2}, {:.2}]",
-            x.shape(),
-            s1.min(0)?.to_scalar::<f32>().unwrap_or(0.0),
-            s1.max(0)?.to_scalar::<f32>().unwrap_or(0.0),
-        );
 
         // Stage 2: Depthwise Conv2d(C, 3×3, groups=C, stride=2, pad=1)
         let x = conv2d_manual(&x, &self.conv5_w, Some(&self.conv5_b), 2, 1, self.channels)?;
-        let s2dw = x.flatten_all()?;
-        eprintln!(
-            "[sub-debug] stage2_dw: {:?}, range=[{:.2}, {:.2}]",
-            x.shape(),
-            s2dw.min(0)?.to_scalar::<f32>().unwrap_or(0.0),
-            s2dw.max(0)?.to_scalar::<f32>().unwrap_or(0.0),
-        );
         // Pointwise Conv2d(C→C, 1×1) + ReLU (conv[7] в NeMo)
         let x = conv2d_manual(&x, &self.conv6_w, Some(&self.conv6_b), 1, 0, 1)?;
         let x = x.relu()?;
@@ -684,50 +676,26 @@ impl FastConformerEncoder {
     pub fn forward(&self, mel: &Tensor) -> Result<Tensor> {
         // NeMo: transpose(1,2) mel [B,D,T] → [B,T,D], потом unsqueeze → [B,1,T,D]
         // Conv2d: dim2=time(T), dim3=freq(D)
+        let device = mel.device().clone();
         let x = mel.permute((0, 2, 1))?.unsqueeze(1)?; // [B, 1, T, D]
 
         // Subsampling: [B, 1, T, D] → [B, T/8, d_model]
         let x = self.subsampling.forward(&x)?;
-        let sub_flat = x.flatten_all()?;
-        eprintln!(
-            "[enc-debug] subsampling: {:?}, range=[{:.2}, {:.2}]",
-            x.shape(),
-            sub_flat.min(0)?.to_scalar::<f32>().unwrap_or(0.0),
-            sub_flat.max(0)?.to_scalar::<f32>().unwrap_or(0.0),
-        );
-        // Element-wise debug для сравнения с NeMo
-        if std::env::var("PARAKEET_DEBUG_ELEMENTS").is_ok() {
-            let row0: Vec<f32> = x.i((0, 0, ..))?.to_vec1()?;
-            eprintln!("[enc-debug] sub[0,:8]: {:?}", &row0[..8]);
-            let row1: Vec<f32> = x.i((0, 1, ..))?.to_vec1()?;
-            eprintln!("[enc-debug] sub[1,:8]: {:?}", &row1[..8]);
-            let row30: Vec<f32> = x.i((0, 30, ..))?.to_vec1()?;
-            eprintln!("[enc-debug] sub[30,:8]: {:?}", &row30[..8]);
-        }
+        flush_metal_pool(&device);
 
-        // Positional encoding: масштабирование + PE
+        // Positional encoding
         let (x, pos_emb) = self.pos_enc.forward(&x)?;
 
-        // N × ConformerLayer
+        // N × ConformerLayer с periodic flush (аналог Qwen3-ASR per-step flush)
         let mut x = x;
-        debug!(
-            "Pre-conformer (after xscale): [{:.4}, {:.4}]",
-            x.flatten_all()?.min(0)?.to_scalar::<f32>().unwrap_or(0.0),
-            x.flatten_all()?.max(0)?.to_scalar::<f32>().unwrap_or(0.0),
-        );
         for (i, layer) in self.layers.iter().enumerate() {
             x = layer.forward(&x, &pos_emb)?;
-            if i < 3 || i == self.layers.len() - 1 {
-                let lf = x.flatten_all()?;
-                eprintln!(
-                    "[enc-debug] layer {}: range=[{:.6}, {:.6}]",
-                    i,
-                    lf.min(0)?.to_scalar::<f32>().unwrap_or(0.0),
-                    lf.max(0)?.to_scalar::<f32>().unwrap_or(0.0),
-                );
+            // Flush каждые 4 layer — баланс между fragmentation и overhead
+            if (i + 1) % 4 == 0 {
+                flush_metal_pool(&device);
             }
         }
-
+        flush_metal_pool(&device);
         Ok(x)
     }
 }

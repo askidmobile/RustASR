@@ -119,8 +119,7 @@ impl ParakeetModel {
             )));
         }
 
-        // F32 на Metal/CPU — mel extraction (FFT) требует F32.
-        // Candle автоматически upcast'ит F16 safetensors → F32 при загрузке.
+        // F32 на Metal/CPU (как GigaAM/Qwen3-ASR — Metal conv1d ограничения).
         // BF16 только на CUDA.
         let dtype = if device.is_cuda() {
             DType::BF16

@@ -78,7 +78,7 @@ impl TdtGreedyDecoder {
         let t_total = encoder_output.dim(0)?;
         let device = encoder_output.device();
 
-        eprintln!("[tdt-debug] TDT decode: {} фреймов энкодера, blank_idx={}", t_total, self.blank_idx);
+        debug!("TDT decode: {} фреймов энкодера, blank_idx={}", t_total, self.blank_idx);
 
         let mut hypothesis: Vec<u32> = Vec::new();
         let mut timestamps: Vec<(u32, u64)> = Vec::new();
@@ -96,23 +96,13 @@ impl TdtGreedyDecoder {
             let k = token_logits.argmax(D::Minus1)?.to_scalar::<u32>()?;
             let dur_idx = dur_logits.argmax(D::Minus1)?.to_scalar::<u32>()? as usize;
 
-            if step_count < 10 {
-                let blank_score = token_logits.i(self.blank_idx)?.to_scalar::<f32>()?;
-                let logits_vec: Vec<f32> = token_logits.to_vec1()?;
-                let mut indexed: Vec<(usize, f32)> =
-                    logits_vec.iter().copied().enumerate().collect();
-                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-                let top5: Vec<String> = indexed[..5]
-                    .iter()
-                    .map(|(i, v)| format!("{}:{:.3}", i, v))
-                    .collect();
-                eprintln!(
-                    "[tdt-debug] step {}: t={}/{}, k={}, dur_idx={}, blank={:.3}, top=[{}]",
-                    step_count, time_idx, t_total, k, dur_idx, blank_score,
-                    top5.join(", ")
-                );
-            }
             step_count += 1;
+
+            // Periodic Metal pool flush — аналог Qwen3-ASR per-step flush
+            if step_count % 8 == 0 && device.is_metal() {
+                let _ = device.synchronize();
+                let _ = device.flush_buffers();
+            }
 
             let skip = if dur_idx < self.durations.len() {
                 self.durations[dur_idx]
