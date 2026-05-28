@@ -680,7 +680,13 @@ impl FastConformerEncoder {
     /// Forward: mel [1, n_mels, time] → encoder_output [1, T/8, d_model].
     pub fn forward(&self, mel: &Tensor) -> Result<Tensor> {
         let device = mel.device().clone();
-        let x = mel.permute((0, 2, 1))?.unsqueeze(1)?; // [B, 1, T, D]
+        // Cast mel в dtype весов: на CPU/Metal F32, на CUDA BF16. Без cast'а
+        // BF16-веса × F32-mel падают в conv2d_manual (см. парный фикс LSTM
+        // state в decoder, коммит 2d090e9).
+        let x = mel
+            .permute((0, 2, 1))?
+            .unsqueeze(1)?
+            .to_dtype(self.subsampling.weight_dtype())?; // [B, 1, T, D]
 
         // Subsampling: [B, 1, T, D] → [B, T/8, d_model]
         let x = self.subsampling.forward(&x)?;
