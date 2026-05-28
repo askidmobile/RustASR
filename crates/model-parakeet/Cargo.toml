@@ -27,3 +27,10 @@ tracing.workspace = true
 
 # FFT для mel-спектрограммы
 rustfft.workspace = true
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+
+[[example]]
+name = "bench_metal"
+required-features = []
