@@ -16,6 +16,7 @@ use candle_nn::VarBuilder;
 use tracing::debug;
 
 use crate::config::DecoderConfig;
+use crate::encoder::Weights;
 
 /// Один слой LSTM.
 ///
@@ -37,13 +38,25 @@ impl LstmLayer {
         input_size: usize,
         hidden_size: usize,
         layer_idx: usize,
-        vb: VarBuilder,
+        target_dtype: DType,
+        vb: Weights<'_>,
     ) -> Result<Self> {
         let gate_size = 4 * hidden_size;
-        let weight_ih = vb.get((gate_size, input_size), &format!("weight_ih_l{layer_idx}"))?;
-        let weight_hh = vb.get((gate_size, hidden_size), &format!("weight_hh_l{layer_idx}"))?;
-        let bias_ih = vb.get(gate_size, &format!("bias_ih_l{layer_idx}"))?;
-        let bias_hh = vb.get(gate_size, &format!("bias_hh_l{layer_idx}"))?;
+        // LSTM веса — regular tensors. Принудительно cast в target_dtype чтобы
+        // matmul state × weight были одного dtype (на Hybrid path LSTM weights
+        // могут прийти из quantized backend через dequant F32, а state — F16).
+        let weight_ih = vb
+            .get_tensor((gate_size, input_size), &format!("weight_ih_l{layer_idx}"))?
+            .to_dtype(target_dtype)?;
+        let weight_hh = vb
+            .get_tensor((gate_size, hidden_size), &format!("weight_hh_l{layer_idx}"))?
+            .to_dtype(target_dtype)?;
+        let bias_ih = vb
+            .get_tensor(gate_size, &format!("bias_ih_l{layer_idx}"))?
+            .to_dtype(target_dtype)?;
+        let bias_hh = vb
+            .get_tensor(gate_size, &format!("bias_hh_l{layer_idx}"))?
+            .to_dtype(target_dtype)?;
         Ok(Self {
             weight_ih,
             weight_hh,
@@ -136,16 +149,30 @@ pub struct PredictionNet {
 }
 
 impl PredictionNet {
-    /// Загрузка из safetensors.
-    ///
-    /// Ключи:
-    /// - prediction.embed.weight
-    /// - prediction.dec_rnn.lstm.{weight_ih_l0, weight_hh_l0, ...}
+    /// Загрузка из safetensors (legacy F16/F32 path).
     pub fn load(config: &DecoderConfig, vb: VarBuilder) -> Result<Self> {
+        Self::load_from_weights(config, Weights::Standard(vb))
+    }
+
+    /// Универсальная загрузка из Standard или Quantized backend.
+    /// LSTM работает в фиксированном dtype = F32 (numerical stability в gates,
+    /// embedding/weights cast'нутся в F32). pred_out возвращается в F32,
+    /// joint cast'нет в encoder dtype перед добавлением.
+    pub fn load_from_weights(config: &DecoderConfig, vb: Weights<'_>) -> Result<Self> {
+        Self::load_with_dtype(config, vb, DType::F32)
+    }
+
+    pub fn load_with_dtype(
+        config: &DecoderConfig,
+        vb: Weights<'_>,
+        target_dtype: DType,
+    ) -> Result<Self> {
         let pred_vb = vb.pp("prediction");
 
-        // Embedding
-        let embedding = pred_vb.get((config.vocab_size, config.embed_dim), "embed.weight")?;
+        // Embedding cast'нут в target_dtype для match с LSTM weights
+        let embedding = pred_vb
+            .get_tensor((config.vocab_size, config.embed_dim), "embed.weight")?
+            .to_dtype(target_dtype)?;
 
         // LSTM layers
         let lstm_vb = pred_vb.pp("dec_rnn").pp("lstm");
@@ -156,7 +183,8 @@ impl PredictionNet {
             } else {
                 config.pred_hidden
             };
-            let layer = LstmLayer::load(input_size, config.pred_hidden, i, lstm_vb.clone())?;
+            let layer =
+                LstmLayer::load(input_size, config.pred_hidden, i, target_dtype, lstm_vb.clone())?;
             lstm_layers.push(layer);
         }
 

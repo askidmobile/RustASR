@@ -26,7 +26,45 @@ const TEST_WAV_PATHS: &[&str] = &[
 
 const MODEL_PATH: &str = "/Volumes/Askid Dev/Projects/RustASR/models/parakeet-tdt-0.6b-v3";
 
-/// macOS process RSS via mach API.
+/// macOS phys_footprint via `footprint` — единственный честный показатель.
+/// Считает: anonymous heap + mmap'd file pages touched + Metal unified memory.
+/// `ps -o rss=` НЕ включает Metal GPU buffers (отдельный аллокатор Apple Silicon).
+fn process_phys_footprint_mb() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        // `footprint` CLI: первая строка "<name> [pid]: 64-bit    Footprint: NNNN KB"
+        let pid = std::process::id().to_string();
+        let output = std::process::Command::new("footprint")
+            .args(["-p", &pid])
+            .output()
+            .ok()?;
+        let s = String::from_utf8_lossy(&output.stdout);
+        // Parse "Footprint: NNNN KB" anywhere in stdout
+        for line in s.lines() {
+            if let Some(idx) = line.find("Footprint:") {
+                let tail = &line[idx + "Footprint:".len()..];
+                let parts: Vec<&str> = tail.trim().split_whitespace().collect();
+                if parts.len() >= 2 {
+                    let num: f64 = parts[0].parse().ok()?;
+                    let unit = parts[1];
+                    let mb = match unit {
+                        "B" => num / 1_048_576.0,
+                        "KB" => num / 1024.0,
+                        "MB" => num,
+                        "GB" => num * 1024.0,
+                        _ => return None,
+                    };
+                    return Some(mb as u64);
+                }
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "macos"))]
+    None
+}
+
+/// Fallback: ps -o rss= (НЕ включает Metal GPU memory!).
 fn process_rss_mb() -> Option<u64> {
     #[cfg(target_os = "macos")]
     {
@@ -40,6 +78,84 @@ fn process_rss_mb() -> Option<u64> {
     }
     #[cfg(not(target_os = "macos"))]
     None
+}
+
+/// vmmap parse: "REGION TYPE ... VIRTUAL SIZE DIRTY SIZE" — берём Metal regions.
+fn metal_alloc_mb() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        let pid = std::process::id().to_string();
+        let output = std::process::Command::new("vmmap")
+            .args(["-summary", &pid])
+            .output()
+            .ok()?;
+        let s = String::from_utf8_lossy(&output.stdout);
+        // Parse "IOKit                            X.XG  ..." и "Stack" "MALLOC_LARGE" etc.
+        // На Apple Silicon Metal buffers идут как IOKit или Stack regions.
+        let mut iokit_mb = 0u64;
+        for line in s.lines() {
+            // Грубо: ищем строки начинающиеся с "IOKit" или "VM_ALLOCATE" большие
+            let lower = line.to_lowercase();
+            if lower.contains("iokit") || lower.contains("mapped file") || lower.contains("vm_allocate") {
+                // Парсим размер: формат "  IOKit    1.2G 1024K  ..."
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                for p in &parts {
+                    if let Some(num_str) = p.strip_suffix('G') {
+                        if let Ok(gb) = num_str.parse::<f64>() {
+                            iokit_mb += (gb * 1024.0) as u64;
+                            break;
+                        }
+                    } else if let Some(num_str) = p.strip_suffix('M') {
+                        if let Ok(mb) = num_str.parse::<f64>() {
+                            iokit_mb += mb as u64;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        Some(iokit_mb)
+    }
+    #[cfg(not(target_os = "macos"))]
+    None
+}
+
+/// Track peak memory by sampling in background thread.
+struct PeakMemTracker {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    peak_phys_mb: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PeakMemTracker {
+    fn start() -> Self {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let stop = Arc::new(AtomicBool::new(false));
+        let peak = Arc::new(AtomicU64::new(0));
+        let stop_clone = stop.clone();
+        let peak_clone = peak.clone();
+        let handle = std::thread::spawn(move || {
+            while !stop_clone.load(Ordering::Relaxed) {
+                if let Some(mb) = process_phys_footprint_mb() {
+                    let prev = peak_clone.load(Ordering::Relaxed);
+                    if mb > prev {
+                        peak_clone.store(mb, Ordering::Relaxed);
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
+        Self { stop, peak_phys_mb: peak, handle: Some(handle) }
+    }
+
+    fn stop(mut self) -> u64 {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+        self.peak_phys_mb.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 fn load_wav_16k(path: &str) -> Vec<f32> {
@@ -110,26 +226,30 @@ struct BenchResult {
     text: String,
     word_count: usize,
     streaming_token_count: usize,
+    peak_phys_mb: u64,
+    delta_phys_mb: i64,
 }
 
 fn print_table(rows: &[BenchResult]) {
     println!();
-    println!("┌─────────────────────────────────┬──────────┬──────────┬────────┬──────────┬───────┐");
-    println!("│ label                           │ audio    │ infer    │ RTF    │ stream   │ words │");
-    println!("│                                 │ (sec)    │ (ms)     │        │ tokens   │       │");
-    println!("├─────────────────────────────────┼──────────┼──────────┼────────┼──────────┼───────┤");
+    println!("┌──────────────────────┬───────┬──────┬───────┬────────┬───────┬───────────┬──────────┐");
+    println!("│ label                │ audio │ ms   │ RTF   │ stream │ words │ peak phys │ delta    │");
+    println!("│                      │ sec   │      │       │ tokens │       │ (МБ)      │ (МБ)     │");
+    println!("├──────────────────────┼───────┼──────┼───────┼────────┼───────┼───────────┼──────────┤");
     for r in rows {
         println!(
-            "│ {:<31} │ {:>8.2} │ {:>8} │ {:>6.3} │ {:>8} │ {:>5} │",
-            truncate(&r.label, 31),
+            "│ {:<20} │ {:>5.2} │ {:>4} │ {:>5.3} │ {:>6} │ {:>5} │ {:>9} │ {:>+8} │",
+            truncate(&r.label, 20),
             r.duration_sec,
             r.inference_ms,
             r.rtf,
             r.streaming_token_count,
-            r.word_count
+            r.word_count,
+            r.peak_phys_mb,
+            r.delta_phys_mb
         );
     }
-    println!("└─────────────────────────────────┴──────────┴──────────┴────────┴──────────┴───────┘");
+    println!("└──────────────────────┴───────┴──────┴───────┴────────┴───────┴───────────┴──────────┘");
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -152,8 +272,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Parakeet TDT 0.6B v3 — Metal bench ===");
     println!();
 
-    let rss_before_load = process_rss_mb().unwrap_or(0);
-    println!("RSS до загрузки модели: {} МБ", rss_before_load);
+    let rss_before = process_rss_mb().unwrap_or(0);
+    let phys_before = process_phys_footprint_mb().unwrap_or(0);
+    let metal_before = metal_alloc_mb().unwrap_or(0);
+    println!("BASELINE (до загрузки модели):");
+    println!("  RSS:             {} МБ (ps -o rss=)", rss_before);
+    println!("  Phys footprint:  {} МБ (footprint — включает Metal!)", phys_before);
+    println!("  IOKit/Metal:     {} МБ (vmmap)", metal_before);
 
     let device = Device::new_metal(0).map_err(|e| format!("Metal init: {e}"))?;
     println!("Device: Metal GPU (M-series)");
@@ -162,14 +287,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut model = ParakeetModel::load(MODEL_PATH, &device)?;
     let load_ms = load_t0.elapsed().as_millis();
 
-    let rss_after_load = process_rss_mb().unwrap_or(0);
-    println!(
-        "Загрузка: {} мс, RSS: {} МБ → {} МБ (delta: +{} МБ)",
-        load_ms,
-        rss_before_load,
-        rss_after_load,
-        rss_after_load.saturating_sub(rss_before_load)
-    );
+    let rss_after = process_rss_mb().unwrap_or(0);
+    let phys_after = process_phys_footprint_mb().unwrap_or(0);
+    let metal_after = metal_alloc_mb().unwrap_or(0);
+    println!();
+    println!("AFTER LOAD ({} мс):", load_ms);
+    println!("  RSS:             {} МБ (+{} МБ)", rss_after, rss_after.saturating_sub(rss_before));
+    println!("  Phys footprint:  {} МБ (+{} МБ) ← ЧЕСТНАЯ ЦИФРА", phys_after, phys_after.saturating_sub(phys_before));
+    println!("  IOKit/Metal:     {} МБ (+{} МБ)", metal_after, metal_after.saturating_sub(metal_before));
 
     // Warmup: первая инференция всегда дольше (Metal kernel compile + driver setup).
     println!();
@@ -208,9 +333,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let samples = load_wav_16k(&path);
         let actual_dur = samples.len() as f64 / 16000.0;
 
-        // Замер streaming: считаем сколько токенов эмитится через callback.
+        // Замер streaming + peak memory во время transcribe.
         use std::cell::Cell;
         let stream_tokens = Cell::new(0usize);
+        let phys_before_call = process_phys_footprint_mb().unwrap_or(0);
+        let tracker = PeakMemTracker::start();
 
         let t0 = Instant::now();
         let result = model
@@ -218,20 +345,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 stream_tokens.set(stream_tokens.get() + 1);
             })?;
         let elapsed_ms = t0.elapsed().as_millis();
+
+        let peak_phys = tracker.stop();
+        let phys_after_call = process_phys_footprint_mb().unwrap_or(0);
         let stream_tokens = stream_tokens.get();
+        let delta = phys_after_call as i64 - phys_before_call as i64;
 
         let rtf = elapsed_ms as f64 / 1000.0 / actual_dur;
         let word_count = result.text.split_whitespace().count();
 
         println!(
-            "[{}] {:.2}с → \"{}\" ({} мс, RTF={:.3}, {} stream tokens, {} words)",
+            "[{}] {:.2}с → \"{}\" ({} мс, RTF={:.3}, {} stream tokens, {} words, peak={} МБ delta={:+} МБ)",
             label,
             actual_dur,
             truncate(&result.text, 80),
             elapsed_ms,
             rtf,
             stream_tokens,
-            word_count
+            word_count,
+            peak_phys,
+            delta,
         );
 
         results.push(BenchResult {
@@ -242,6 +375,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             text: result.text,
             word_count,
             streaming_token_count: stream_tokens,
+            peak_phys_mb: peak_phys,
+            delta_phys_mb: delta,
         });
 
         // Очистка temp.
@@ -258,12 +393,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             use std::cell::Cell;
             let stream_tokens = Cell::new(0usize);
+            let phys_before_call = process_phys_footprint_mb().unwrap_or(0);
+            let tracker = PeakMemTracker::start();
             let t0 = Instant::now();
             let result = model.transcribe_streaming(chunk_3s, &default_opts(), |_t, _w, _ts| {
                 stream_tokens.set(stream_tokens.get() + 1);
             })?;
             let elapsed_ms = t0.elapsed().as_millis();
+            let peak_phys = tracker.stop();
+            let phys_after_call = process_phys_footprint_mb().unwrap_or(0);
             let stream_tokens = stream_tokens.get();
+            let delta = phys_after_call as i64 - phys_before_call as i64;
             let rtf = elapsed_ms as f64 / 1000.0 / actual_dur;
             let word_count = result.text.split_whitespace().count();
 
@@ -277,20 +417,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             results.push(BenchResult {
-                label: "fallback-test_real_audio 3s".to_string(),
+                label: "fallback".to_string(),
                 duration_sec: actual_dur,
                 inference_ms: elapsed_ms,
                 rtf,
                 text: result.text,
                 word_count,
                 streaming_token_count: stream_tokens,
+                peak_phys_mb: peak_phys,
+                delta_phys_mb: delta,
             });
         }
     }
 
     let rss_final = process_rss_mb().unwrap_or(0);
+    let phys_final = process_phys_footprint_mb().unwrap_or(0);
+    let metal_final = metal_alloc_mb().unwrap_or(0);
     println!();
-    println!("RSS финальный: {} МБ (delta от старта: +{} МБ)", rss_final, rss_final.saturating_sub(rss_before_load));
+    println!("FINAL (после всех transcribe + drop):");
+    println!("  RSS:             {} МБ (delta от старта: +{} МБ)", rss_final, rss_final.saturating_sub(rss_before));
+    println!("  Phys footprint:  {} МБ (delta: +{} МБ) ← ЧЕСТНАЯ", phys_final, phys_final.saturating_sub(phys_before));
+    println!("  IOKit/Metal:     {} МБ (delta: +{} МБ)", metal_final, metal_final.saturating_sub(metal_before));
 
     print_table(&results);
 
@@ -298,13 +445,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !results.is_empty() {
         let avg_rtf: f64 = results.iter().map(|r| r.rtf).sum::<f64>() / results.len() as f64;
         let max_rtf = results.iter().map(|r| r.rtf).fold(0.0f64, f64::max);
+        let peak_phys_all: u64 = results.iter().map(|r| r.peak_phys_mb).max().unwrap_or(0);
         println!();
         println!("СВОДКА:");
-        println!("  Avg RTF:     {:.3}", avg_rtf);
-        println!("  Max RTF:     {:.3} (worst case)", max_rtf);
-        println!("  Memory:      +{} МБ over baseline", rss_final.saturating_sub(rss_before_load));
-        println!("  Load time:   {} мс", load_ms);
-        println!("  Warmup:      {} мс", warmup_ms);
+        println!("  Avg RTF:                  {:.3}", avg_rtf);
+        println!("  Max RTF:                  {:.3} (worst case)", max_rtf);
+        println!("  Peak phys footprint:      {} МБ (max across runs — ВКЛЮЧАЕТ Metal)", peak_phys_all);
+        println!("  Final phys delta:         +{} МБ over baseline", phys_final.saturating_sub(phys_before));
+        println!("  Load time:                {} мс", load_ms);
+        println!("  Warmup:                   {} мс", warmup_ms);
+        println!();
+        println!("ВНИМАНИЕ: 'RSS' через ps -o rss= НЕ включает Metal GPU buffers!");
+        println!("Используй 'Phys footprint' — это правда (footprint CLI / mach phys_footprint).");
     }
 
     Ok(())

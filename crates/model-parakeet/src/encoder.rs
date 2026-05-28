@@ -17,22 +17,163 @@ fn flush_metal_pool(device: &Device) {
     }
 }
 use candle_nn::VarBuilder;
+use candle_transformers::quantized_nn;
+use candle_transformers::quantized_var_builder as qvb;
 use tracing::debug;
 
 use crate::config::EncoderConfig;
 
 // ============================================================================
-// Вспомогательные функции
+// Weights enum: Standard (F32/F16 safetensors) или Quantized (Q8 GGUF).
+// LinearLayer enum: соответствующий Linear-wrapper.
+// Аналог pattern из qwen3-decoder (crates/qwen3-decoder/src/layers.rs:11-65).
 // ============================================================================
 
-/// Загрузка Linear без bias (используя candle_nn для правильного batched broadcasting).
-fn linear_no_bias(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<candle_nn::Linear> {
-    candle_nn::linear_no_bias(in_dim, out_dim, vb)
+#[derive(Clone)]
+pub enum Weights<'a> {
+    /// safetensors path — все тензоры как regular F32/F16.
+    Standard(VarBuilder<'a>),
+    /// GGUF Q8 path — ВСЕ тензоры как QTensor (Q8 для linears, F32/F16 wrap
+    /// для conv/norm/embed/lstm). Каждый get_tensor вызывает dequantize.
+    Quantized(qvb::VarBuilder),
+    /// Hybrid path — лучшая память: Q8 linears через quantized backend,
+    /// остальные тензоры через standard VarBuilder (без extra dequant копий).
+    Hybrid {
+        quantized: qvb::VarBuilder,
+        standard: VarBuilder<'a>,
+    },
+}
+
+impl<'a> Weights<'a> {
+    pub fn pp<S: ToString>(&self, s: S) -> Self {
+        match self {
+            Self::Standard(vb) => Self::Standard(vb.pp(s)),
+            Self::Quantized(vb) => Self::Quantized(vb.pp(s)),
+            Self::Hybrid {
+                quantized,
+                standard,
+            } => {
+                let s_str = s.to_string();
+                Self::Hybrid {
+                    quantized: quantized.pp(&s_str),
+                    standard: standard.pp(&s_str),
+                }
+            }
+        }
+    }
+
+    /// Получить regular Tensor. На Hybrid path сначала ищем в standard backend,
+    /// если нет — fallback на quantized (с dequant). Это покрывает случай когда
+    /// vocab embedding в GGUF хранится как Q8 (большой по размеру), но
+    /// PredictionNet ожидает его как regular Tensor.
+    pub fn get_tensor<S: Into<candle_core::Shape>>(
+        &self,
+        shape: S,
+        name: &str,
+    ) -> Result<Tensor> {
+        match self {
+            Self::Standard(vb) => vb.get(shape, name),
+            Self::Quantized(vb) => {
+                let qt = vb.get(shape, name)?;
+                qt.dequantize(self.device())
+            }
+            Self::Hybrid {
+                quantized,
+                standard,
+            } => {
+                let shape = shape.into();
+                if standard.contains_tensor(name) {
+                    standard.get(shape, name)
+                } else {
+                    let qt = quantized.get(shape, name)?;
+                    qt.dequantize(self.device())
+                }
+            }
+        }
+    }
+
+    pub fn device(&self) -> &Device {
+        match self {
+            Self::Standard(vb) => vb.device(),
+            Self::Quantized(vb) => vb.device(),
+            Self::Hybrid { standard, .. } => standard.device(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum LinearLayer {
+    Standard(candle_nn::Linear),
+    Quantized(quantized_nn::Linear),
+}
+
+impl LinearLayer {
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Standard(l) => l.forward(x),
+            Self::Quantized(l) => {
+                // QMatMul на Q8 всегда возвращает F32 (dequant pipeline).
+                // Cast обратно в input dtype чтобы pipeline F16/F32 был сохранён
+                // для последующих residual add'ов.
+                let in_dtype = x.dtype();
+                let y = l.forward(x)?;
+                if y.dtype() != in_dtype {
+                    y.to_dtype(in_dtype)
+                } else {
+                    Ok(y)
+                }
+            }
+        }
+    }
+}
+
+impl Module for LinearLayer {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        LinearLayer::forward(self, x)
+    }
+}
+
+/// Загрузка Linear без bias.
+fn linear_no_bias(in_dim: usize, out_dim: usize, vb: Weights<'_>) -> Result<LinearLayer> {
+    match vb {
+        Weights::Standard(vb) => Ok(LinearLayer::Standard(candle_nn::linear_no_bias(
+            in_dim, out_dim, vb,
+        )?)),
+        Weights::Quantized(vb) => Ok(LinearLayer::Quantized(quantized_nn::linear_no_bias(
+            in_dim, out_dim, vb,
+        )?)),
+        Weights::Hybrid { quantized, .. } => Ok(LinearLayer::Quantized(
+            quantized_nn::linear_no_bias(in_dim, out_dim, quantized)?,
+        )),
+    }
 }
 
 /// Загрузка Linear с bias.
-fn linear_with_bias(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<candle_nn::Linear> {
-    candle_nn::linear(in_dim, out_dim, vb)
+fn linear_with_bias(in_dim: usize, out_dim: usize, vb: Weights<'_>) -> Result<LinearLayer> {
+    match vb {
+        Weights::Standard(vb) => Ok(LinearLayer::Standard(candle_nn::linear(
+            in_dim, out_dim, vb,
+        )?)),
+        Weights::Quantized(vb) => Ok(LinearLayer::Quantized(quantized_nn::linear(
+            in_dim, out_dim, vb,
+        )?)),
+        Weights::Hybrid {
+            quantized,
+            standard,
+        } => {
+            // QMatMul на Q8 weight всегда даёт F32 output → bias обязан быть F32
+            // (иначе broadcast_add F32 + F16 = mismatch). LinearLayer.forward
+            // cast'нет результат обратно в input dtype для residual compat.
+            let qweight = quantized.get((out_dim, in_dim), "weight")?;
+            let bias = standard
+                .get(out_dim, "bias")?
+                .to_dtype(candle_core::DType::F32)?;
+            Ok(LinearLayer::Quantized(quantized_nn::Linear::from_arc(
+                qweight,
+                Some(bias),
+            )?))
+        }
+    }
 }
 
 // ============================================================================
@@ -46,12 +187,16 @@ struct LayerNorm {
 }
 
 impl LayerNorm {
-    fn load(dim: usize, vb: VarBuilder) -> Result<Self> {
+    fn load(dim: usize, vb: Weights<'_>) -> Result<Self> {
         // Force F32 для weight/bias чтобы norm computation корректно работала
-        // с любым input dtype (F32/F16). VarBuilder с dtype=F16 cast'ит на get()
-        // обратно в F16, что ломает numerical stability в norm.
-        let weight = vb.get(dim, "weight")?.to_dtype(candle_core::DType::F32)?;
-        let bias = vb.get(dim, "bias")?.to_dtype(candle_core::DType::F32)?;
+        // с любым input dtype (F32/F16). Для Quantized backend get_tensor
+        // выполнит dequantize → norms всё равно загружаются как regular tensors.
+        let weight = vb
+            .get_tensor(dim, "weight")?
+            .to_dtype(candle_core::DType::F32)?;
+        let bias = vb
+            .get_tensor(dim, "bias")?
+            .to_dtype(candle_core::DType::F32)?;
         Ok(Self {
             weight,
             bias,
@@ -97,12 +242,20 @@ struct BatchNorm1d {
 }
 
 impl BatchNorm1d {
-    fn load(dim: usize, vb: VarBuilder) -> Result<Self> {
+    fn load(dim: usize, vb: Weights<'_>) -> Result<Self> {
         // Force F32 stats — running_var/mean precision критична, не должна быть F16
-        let weight = vb.get(dim, "weight")?.to_dtype(candle_core::DType::F32)?;
-        let bias = vb.get(dim, "bias")?.to_dtype(candle_core::DType::F32)?;
-        let running_mean = vb.get(dim, "running_mean")?.to_dtype(candle_core::DType::F32)?;
-        let running_var = vb.get(dim, "running_var")?.to_dtype(candle_core::DType::F32)?;
+        let weight = vb
+            .get_tensor(dim, "weight")?
+            .to_dtype(candle_core::DType::F32)?;
+        let bias = vb
+            .get_tensor(dim, "bias")?
+            .to_dtype(candle_core::DType::F32)?;
+        let running_mean = vb
+            .get_tensor(dim, "running_mean")?
+            .to_dtype(candle_core::DType::F32)?;
+        let running_var = vb
+            .get_tensor(dim, "running_var")?
+            .to_dtype(candle_core::DType::F32)?;
         Ok(Self {
             weight,
             bias,
@@ -166,7 +319,7 @@ struct DwStridingSubsampling {
     conv5_b: Tensor,
     conv6_w: Tensor,
     conv6_b: Tensor,
-    out: candle_nn::Linear,
+    out: LinearLayer,
     channels: usize,
 }
 
@@ -176,30 +329,31 @@ impl DwStridingSubsampling {
         self.conv0_w.dtype()
     }
 
-    fn load(config: &EncoderConfig, vb: VarBuilder) -> Result<Self> {
+    fn load(config: &EncoderConfig, vb: Weights<'_>) -> Result<Self> {
         let c = config.subsampling_conv_channels; // 256
 
         let conv_vb = vb.pp("conv");
 
-        // Stage 0: Conv2d(1, C, 3, stride=2)
-        let conv0_w = conv_vb.get((c, 1, 3, 3), "0.weight")?;
-        let conv0_b = conv_vb.get(c, "0.bias")?;
+        // Stage 0: Conv2d(1, C, 3, stride=2) — conv weights остаются regular tensors
+        // (нет смысла квантовать 3×3 conv с 1 in_channel)
+        let conv0_w = conv_vb.get_tensor((c, 1, 3, 3), "0.weight")?;
+        let conv0_b = conv_vb.get_tensor(c, "0.bias")?;
 
         // Stage 1: depthwise Conv2d(C, C, 3, groups=C, stride=2)
-        let conv2_w = conv_vb.get((c, 1, 3, 3), "2.weight")?;
-        let conv2_b = conv_vb.get(c, "2.bias")?;
+        let conv2_w = conv_vb.get_tensor((c, 1, 3, 3), "2.weight")?;
+        let conv2_b = conv_vb.get_tensor(c, "2.bias")?;
 
         // Stage 1: pointwise Conv2d(C, C, 1)
-        let conv3_w = conv_vb.get((c, c, 1, 1), "3.weight")?;
-        let conv3_b = conv_vb.get(c, "3.bias")?;
+        let conv3_w = conv_vb.get_tensor((c, c, 1, 1), "3.weight")?;
+        let conv3_b = conv_vb.get_tensor(c, "3.bias")?;
 
         // Stage 2: depthwise Conv2d(C, C, 3, groups=C, stride=2)
-        let conv5_w = conv_vb.get((c, 1, 3, 3), "5.weight")?;
-        let conv5_b = conv_vb.get(c, "5.bias")?;
+        let conv5_w = conv_vb.get_tensor((c, 1, 3, 3), "5.weight")?;
+        let conv5_b = conv_vb.get_tensor(c, "5.bias")?;
 
         // Stage 2: pointwise Conv2d(C, C, 1)
-        let conv6_w = conv_vb.get((c, c, 1, 1), "6.weight")?;
-        let conv6_b = conv_vb.get(c, "6.bias")?;
+        let conv6_w = conv_vb.get_tensor((c, c, 1, 1), "6.weight")?;
+        let conv6_b = conv_vb.get_tensor(c, "6.bias")?;
 
         // Проекция: Linear(C * freq_out, d_model)
         // freq_out = feat_in / 8 = 128 / 8 = 16
@@ -365,11 +519,11 @@ impl RelPositionalEncoding {
 ///
 /// score = (q + bias_u) @ K^T + rel_shift((q + bias_v) @ P^T)
 struct RelPositionMultiHeadAttention {
-    linear_q: candle_nn::Linear,
-    linear_k: candle_nn::Linear,
-    linear_v: candle_nn::Linear,
-    linear_out: candle_nn::Linear,
-    linear_pos: candle_nn::Linear,
+    linear_q: LinearLayer,
+    linear_k: LinearLayer,
+    linear_v: LinearLayer,
+    linear_out: LinearLayer,
+    linear_pos: LinearLayer,
     pos_bias_u: Tensor,
     pos_bias_v: Tensor,
     n_heads: usize,
@@ -377,15 +531,16 @@ struct RelPositionMultiHeadAttention {
 }
 
 impl RelPositionMultiHeadAttention {
-    fn load(d_model: usize, n_heads: usize, d_k: usize, vb: VarBuilder) -> Result<Self> {
+    fn load(d_model: usize, n_heads: usize, d_k: usize, vb: Weights<'_>) -> Result<Self> {
         let linear_q = linear_no_bias(d_model, d_model, vb.pp("linear_q"))?;
         let linear_k = linear_no_bias(d_model, d_model, vb.pp("linear_k"))?;
         let linear_v = linear_no_bias(d_model, d_model, vb.pp("linear_v"))?;
         let linear_out = linear_no_bias(d_model, d_model, vb.pp("linear_out"))?;
         let linear_pos = linear_no_bias(d_model, d_model, vb.pp("linear_pos"))?;
 
-        let pos_bias_u = vb.get((n_heads, d_k), "pos_bias_u")?;
-        let pos_bias_v = vb.get((n_heads, d_k), "pos_bias_v")?;
+        // pos_bias_u/v — обучаемые векторы, не Linear weights → regular tensors
+        let pos_bias_u = vb.get_tensor((n_heads, d_k), "pos_bias_u")?;
+        let pos_bias_v = vb.get_tensor((n_heads, d_k), "pos_bias_v")?;
 
         Ok(Self {
             linear_q,
@@ -501,12 +656,12 @@ impl RelPositionMultiHeadAttention {
 /// Feed-forward модуль: Linear → SiLU → Linear.
 /// Все linear без bias.
 struct ConformerFeedForward {
-    linear1: candle_nn::Linear,
-    linear2: candle_nn::Linear,
+    linear1: LinearLayer,
+    linear2: LinearLayer,
 }
 
 impl ConformerFeedForward {
-    fn load(d_model: usize, d_ff: usize, vb: VarBuilder) -> Result<Self> {
+    fn load(d_model: usize, d_ff: usize, vb: Weights<'_>) -> Result<Self> {
         let linear1 = linear_no_bias(d_model, d_ff, vb.pp("linear1"))?;
         let linear2 = linear_no_bias(d_ff, d_model, vb.pp("linear2"))?;
         Ok(Self { linear1, linear2 })
@@ -538,11 +693,17 @@ struct ConformerConvolution {
 }
 
 impl ConformerConvolution {
-    fn load(d_model: usize, kernel_size: usize, vb: VarBuilder) -> Result<Self> {
-        let pointwise_conv1_w = vb.get((2 * d_model, d_model, 1), "pointwise_conv1.weight")?;
-        let depthwise_conv_w = vb.get((d_model, 1, kernel_size), "depthwise_conv.weight")?;
+    fn load(d_model: usize, kernel_size: usize, vb: Weights<'_>) -> Result<Self> {
+        // Pointwise/depthwise conv1d weights — оставляем regular tensors.
+        // Quantization для conv1d даёт небольшую экономию и риски потери качества;
+        // основной memory win — на FFN/MHA linear weights.
+        let pointwise_conv1_w =
+            vb.get_tensor((2 * d_model, d_model, 1), "pointwise_conv1.weight")?;
+        let depthwise_conv_w =
+            vb.get_tensor((d_model, 1, kernel_size), "depthwise_conv.weight")?;
         let batch_norm = BatchNorm1d::load(d_model, vb.pp("batch_norm"))?;
-        let pointwise_conv2_w = vb.get((d_model, d_model, 1), "pointwise_conv2.weight")?;
+        let pointwise_conv2_w =
+            vb.get_tensor((d_model, d_model, 1), "pointwise_conv2.weight")?;
 
         Ok(Self {
             pointwise_conv1_w,
@@ -612,7 +773,7 @@ struct ConformerLayer {
 }
 
 impl ConformerLayer {
-    fn load(config: &EncoderConfig, vb: VarBuilder) -> Result<Self> {
+    fn load(config: &EncoderConfig, vb: Weights<'_>) -> Result<Self> {
         let d = config.d_model;
         let d_ff = config.d_ff;
 
@@ -691,8 +852,15 @@ pub struct FastConformerEncoder {
 }
 
 impl FastConformerEncoder {
-    /// Загрузка весов из safetensors через VarBuilder.
+    /// Загрузка весов из safetensors через VarBuilder (legacy F16/F32 path).
     pub fn load(config: &EncoderConfig, vb: VarBuilder) -> Result<Self> {
+        Self::load_from_weights(config, Weights::Standard(vb))
+    }
+
+    /// Унифицированная загрузка из любого backend (Standard safetensors или
+    /// Quantized GGUF). Quantized backend хранит FFN/MHA linear weights как Q8
+    /// QTensors, остальные тензоры dequant'ятся в target dtype.
+    pub fn load_from_weights(config: &EncoderConfig, vb: Weights<'_>) -> Result<Self> {
         let subsampling = DwStridingSubsampling::load(config, vb.pp("pre_encode"))?;
         let pos_enc = RelPositionalEncoding::new(config.d_model);
 

@@ -11,56 +11,69 @@
 //! - joint.pred.weight: [640, 640], joint.pred.bias: [640]
 //! - joint.joint_net.2.weight: [8198, 640], joint.joint_net.2.bias: [8198]
 
-use candle_core::{Module, Result, Tensor};
+use candle_core::{Result, Tensor};
 use candle_nn::VarBuilder;
+use candle_transformers::quantized_nn;
 use tracing::debug;
 
 use crate::config::JointConfig;
+use crate::encoder::{LinearLayer, Weights};
 
-/// Линейный слой с bias.
-struct Linear {
-    weight: Tensor,
-    bias: Tensor,
-}
-
-impl Linear {
-    fn load(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Self> {
-        let weight = vb.get((out_dim, in_dim), "weight")?;
-        let bias = vb.get(out_dim, "bias")?;
-        Ok(Self { weight, bias })
-    }
-}
-
-impl Module for Linear {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        x.matmul(&self.weight.t()?)?.broadcast_add(&self.bias)
+/// Загрузка Linear с bias через универсальный Weights backend.
+fn load_linear(in_dim: usize, out_dim: usize, vb: Weights<'_>) -> Result<LinearLayer> {
+    match vb {
+        Weights::Standard(vb) => Ok(LinearLayer::Standard(candle_nn::linear(
+            in_dim, out_dim, vb,
+        )?)),
+        Weights::Quantized(vb) => Ok(LinearLayer::Quantized(quantized_nn::linear(
+            in_dim, out_dim, vb,
+        )?)),
+        Weights::Hybrid {
+            quantized,
+            standard,
+        } => {
+            // bias обязан быть F32: QMatMul на Q8 weight → F32 output, sum F32+F32.
+            let qweight = quantized.get((out_dim, in_dim), "weight")?;
+            let bias = standard
+                .get(out_dim, "bias")?
+                .to_dtype(candle_core::DType::F32)?;
+            Ok(LinearLayer::Quantized(quantized_nn::Linear::from_arc(
+                qweight,
+                Some(bias),
+            )?))
+        }
     }
 }
 
 /// Joint Network: enc_proj + pred_proj → ReLU → output_linear.
 pub struct JointNetwork {
-    enc_proj: Linear,
-    pred_proj: Linear,
-    output_linear: Linear,
+    enc_proj: LinearLayer,
+    pred_proj: LinearLayer,
+    output_linear: LinearLayer,
     num_classes: usize,
     num_durations: usize,
 }
 
 impl JointNetwork {
-    /// Загрузка из safetensors.
+    /// Загрузка из safetensors (legacy F16/F32 path).
     pub fn load(config: &JointConfig, vb: VarBuilder) -> Result<Self> {
-        let enc_proj = Linear::load(config.encoder_hidden, config.joint_hidden, vb.pp("enc"))?;
-        let pred_proj = Linear::load(config.pred_hidden, config.joint_hidden, vb.pp("pred"))?;
+        Self::load_from_weights(config, Weights::Standard(vb))
+    }
+
+    /// Универсальная загрузка из Standard (safetensors) или Quantized (GGUF) backend.
+    pub fn load_from_weights(config: &JointConfig, vb: Weights<'_>) -> Result<Self> {
+        let enc_proj = load_linear(config.encoder_hidden, config.joint_hidden, vb.pp("enc"))?;
+        let pred_proj = load_linear(config.pred_hidden, config.joint_hidden, vb.pp("pred"))?;
 
         // output: joint_net.2 (после ReLU[0] и Dropout[1])
         // Пытаемся загрузить с индексом 2, иначе с индексом 1
-        let output_linear = Linear::load(
+        let output_linear = load_linear(
             config.joint_hidden,
             config.output_dim,
             vb.pp("joint_net").pp("2"),
         )
         .or_else(|_| {
-            Linear::load(
+            load_linear(
                 config.joint_hidden,
                 config.output_dim,
                 vb.pp("joint_net").pp("1"),
@@ -150,22 +163,29 @@ impl JointNetwork {
         enc_h_frame: &Tensor,
         pred_out: &Tensor,
     ) -> Result<(Tensor, Tensor)> {
-        // Гарантируем 2D для матмула pred_proj
-        let pred_in = if pred_out.dims().len() == 1 {
-            pred_out.unsqueeze(0)?
-        } else {
-            pred_out.clone()
-        };
-        let pred_h = self.pred_proj.forward(&pred_in)?;
-
-        // enc_h_frame: [joint_hidden] → [1, joint_hidden] для сложения
+        // enc_h_frame: [joint_hidden] → [1, joint_hidden]
         let enc_h_2d = if enc_h_frame.dims().len() == 1 {
             enc_h_frame.unsqueeze(0)?
         } else {
             enc_h_frame.clone()
         };
+        let target_dtype = enc_h_2d.dtype();
 
-        // ReLU(enc_h + pred_h)
+        // Cast pred_out в enc_h dtype чтобы избежать F32×F16 mismatch
+        // (PredictionNet всегда F32, encoder может быть F16/F32)
+        let pred_in = if pred_out.dims().len() == 1 {
+            pred_out.unsqueeze(0)?
+        } else {
+            pred_out.clone()
+        };
+        let pred_in = if pred_in.dtype() != target_dtype {
+            pred_in.to_dtype(target_dtype)?
+        } else {
+            pred_in
+        };
+        let pred_h = self.pred_proj.forward(&pred_in)?;
+
+        // ReLU(enc_h + pred_h) — оба dtype совпадают
         let joint = (enc_h_2d + pred_h)?.relu()?;
 
         // Output logits

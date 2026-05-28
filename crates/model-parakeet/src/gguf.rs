@@ -104,20 +104,15 @@ impl ParakeetGguf {
         let vocab = parse_vocab(&content.metadata)
             .map_err(|e| candle_core::Error::Msg(format!("parse vocab: {e}")))?;
 
-        // Загрузить все тензоры
+        // Загрузить все тензоры. Phase 3b: храним ВСЁ как Quantized(Arc<QTensor>) —
+        // это позволяет передать единый quantized_var_builder в encoder/decoder/joint.
+        // QTensor с GgmlDType::F32/F16 — это просто wrapper над storage, dequantize
+        // даёт исходный Tensor без потери точности.
         let mut tensors = HashMap::with_capacity(content.tensor_infos.len());
         for (name, info) in &content.tensor_infos {
             let qt = content.tensor(&mut file, name, device)?;
-            let gt = if qt.dtype() == candle_core::quantized::GgmlDType::F32 {
-                GgufTensor::Regular(qt.dequantize(device)?)
-            } else if qt.dtype() == candle_core::quantized::GgmlDType::F16 {
-                GgufTensor::Regular(qt.dequantize(device)?.to_dtype(DType::F16)?)
-            } else {
-                // Q8_0, Q4_K, etc.
-                GgufTensor::Quantized(Arc::new(qt))
-            };
             let _ = info;
-            tensors.insert(name.clone(), gt);
+            tensors.insert(name.clone(), GgufTensor::Quantized(Arc::new(qt)));
         }
 
         // Извлечь preprocessor.fb и preprocessor.window для mel extractor
