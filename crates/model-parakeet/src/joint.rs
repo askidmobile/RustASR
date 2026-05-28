@@ -121,4 +121,61 @@ impl JointNetwork {
 
         Ok((token_logits, dur_logits))
     }
+
+    /// Проецирует весь выход энкодера через enc_proj ОДИН РАЗ.
+    ///
+    /// `enc_out`: [T, d_enc=1024] → `enc_h`: [T, joint_hidden=640].
+    /// Результат кешируется в tdt.rs и индексируется по time_idx,
+    /// что устраняет повторный матмул на каждом TDT-шаге.
+    pub fn project_encoder_all(&self, enc_out: &Tensor) -> Result<Tensor> {
+        // enc_out может быть как [T, D] (2D), так и [D] (1D — один фрейм).
+        // Для batch-проекции гарантируем 2D.
+        if enc_out.dims().len() == 1 {
+            let enc_in = enc_out.unsqueeze(0)?;
+            let enc_h = self.enc_proj.forward(&enc_in)?;
+            enc_h.squeeze(0)
+        } else {
+            self.enc_proj.forward(enc_out)
+        }
+    }
+
+    /// Forward с уже вычисленным enc_h для одного фрейма.
+    ///
+    /// `enc_h_frame`: [joint_hidden=640] — один фрейм из кеша enc_h_all.
+    /// `pred_out`: [pred_hidden=640] — выход prediction network.
+    ///
+    /// Эквивалентно `forward(enc_frame, pred_out)`, но enc_proj уже применён.
+    pub fn forward_with_cached_enc(
+        &self,
+        enc_h_frame: &Tensor,
+        pred_out: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        // Гарантируем 2D для матмула pred_proj
+        let pred_in = if pred_out.dims().len() == 1 {
+            pred_out.unsqueeze(0)?
+        } else {
+            pred_out.clone()
+        };
+        let pred_h = self.pred_proj.forward(&pred_in)?;
+
+        // enc_h_frame: [joint_hidden] → [1, joint_hidden] для сложения
+        let enc_h_2d = if enc_h_frame.dims().len() == 1 {
+            enc_h_frame.unsqueeze(0)?
+        } else {
+            enc_h_frame.clone()
+        };
+
+        // ReLU(enc_h + pred_h)
+        let joint = (enc_h_2d + pred_h)?.relu()?;
+
+        // Output logits
+        let logits = self.output_linear.forward(&joint)?.squeeze(0)?;
+
+        // Разделить на token logits и duration logits
+        let token_logits = logits.narrow(candle_core::D::Minus1, 0, self.num_classes)?;
+        let dur_logits =
+            logits.narrow(candle_core::D::Minus1, self.num_classes, self.num_durations)?;
+
+        Ok((token_logits, dur_logits))
+    }
 }

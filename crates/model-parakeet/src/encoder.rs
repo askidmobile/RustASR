@@ -198,12 +198,14 @@ impl DwStridingSubsampling {
     /// Вход: mel transposed [B, 1, T, D] (NeMo convention: dim2=time, dim3=freq)
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // x: [B, 1, T, D] где D=128 (mel bins)
-        debug!(
-            "  Sub input: {:?}, [{:.4}, {:.4}]",
-            x.shape(),
-            x.flatten_all()?.min(0)?.to_scalar::<f32>().unwrap_or(0.0),
-            x.flatten_all()?.max(0)?.to_scalar::<f32>().unwrap_or(0.0),
-        );
+        if std::env::var("PARAKEET_DEBUG").is_ok() {
+            debug!(
+                "  Sub input: {:?}, [{:.4}, {:.4}]",
+                x.shape(),
+                x.flatten_all()?.min(0)?.to_scalar::<f32>().unwrap_or(0.0),
+                x.flatten_all()?.max(0)?.to_scalar::<f32>().unwrap_or(0.0),
+            );
+        }
 
         // Stage 0: Conv2d(1→C, 3×3, stride=2, pad=1) + ReLU
         let x = conv2d_manual(x, &self.conv0_w, Some(&self.conv0_b), 2, 1, 1)?;
@@ -226,21 +228,25 @@ impl DwStridingSubsampling {
         // NeMo: transpose(1,2) → [B, T/8, C, D/8] → reshape → [B, T/8, C*D/8]
         let x = x.permute((0, 2, 1, 3))?; // [B, T, C, F]
         let x = x.contiguous()?.reshape((b, time, ()))?;
-        debug!(
-            "  Pre-proj: {:?}, [{:.4}, {:.4}]",
-            x.shape(),
-            x.flatten_all()?.min(0)?.to_scalar::<f32>().unwrap_or(0.0),
-            x.flatten_all()?.max(0)?.to_scalar::<f32>().unwrap_or(0.0),
-        );
+        if std::env::var("PARAKEET_DEBUG").is_ok() {
+            debug!(
+                "  Pre-proj: {:?}, [{:.4}, {:.4}]",
+                x.shape(),
+                x.flatten_all()?.min(0)?.to_scalar::<f32>().unwrap_or(0.0),
+                x.flatten_all()?.max(0)?.to_scalar::<f32>().unwrap_or(0.0),
+            );
+        }
 
         // Линейная проекция → [B, T, d_model]
         let x = self.out.forward(&x)?;
-        debug!(
-            "  After proj: {:?}, [{:.4}, {:.4}]",
-            x.shape(),
-            x.flatten_all()?.min(0)?.to_scalar::<f32>().unwrap_or(0.0),
-            x.flatten_all()?.max(0)?.to_scalar::<f32>().unwrap_or(0.0),
-        );
+        if std::env::var("PARAKEET_DEBUG").is_ok() {
+            debug!(
+                "  After proj: {:?}, [{:.4}, {:.4}]",
+                x.shape(),
+                x.flatten_all()?.min(0)?.to_scalar::<f32>().unwrap_or(0.0),
+                x.flatten_all()?.max(0)?.to_scalar::<f32>().unwrap_or(0.0),
+            );
+        }
         Ok(x)
     }
 }
@@ -414,9 +420,10 @@ impl RelPositionMultiHeadAttention {
         let scores = (content_score + pos_score)? / scale;
 
         // Softmax + Attention
-        // candle_nn::ops::softmax_last_dim — custom op без Metal impl.
-        // Используем ::softmax (через общие ops: max/sub/exp/sum/div) который работает на Metal.
-        let attn = candle_nn::ops::softmax(&scores?, candle_core::D::Minus1)?;
+        // softmax_last_dim: Metal kernel есть в reduce.metal, но CustomOp1 не зарегистрирован
+        // в candle-fork — падает с "no metal implementation for softmax-last-dim".
+        // Используем ::softmax (через max/sub/exp/sum/div) — работает на Metal.
+        let attn = candle_nn::ops::softmax(&scores?.contiguous()?, candle_core::D::Minus1)?;
         let context = attn.matmul(&v.contiguous()?)?;
 
         // Reshape: [B, H, T, dk] → [B, T, D]

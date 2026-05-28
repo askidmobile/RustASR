@@ -80,29 +80,49 @@ impl TdtGreedyDecoder {
 
         debug!("TDT decode: {} фреймов энкодера, blank_idx={}", t_total, self.blank_idx);
 
+        // P1 — enc_proj cache: проецируем весь encoder output ОДИН раз.
+        // enc_h_all: [T, joint_hidden=640] вместо повторного матмула на каждом фрейме.
+        let enc_h_all = joint.project_encoder_all(encoder_output)?;
+
         let mut hypothesis: Vec<u32> = Vec::new();
         let mut timestamps: Vec<(u32, u64)> = Vec::new();
         let mut state = prediction_net.initial_state(device)?;
         let mut last_token: u32 = self.blank_idx as u32;
         let mut time_idx: usize = 0;
-        let mut step_count: usize = 0;
+
+        // P0a — predictor state cache.
+        // pred_dirty=true означает: нужно пересчитать pred_out перед следующим joint.
+        // Пересчёт нужен только после non-blank emission (last_token изменился).
+        let mut pred_dirty = true;
+        let mut pred_out_cached: Option<Tensor> = None;
 
         while time_idx < t_total {
-            let enc_frame = encoder_output.i(time_idx)?;
-
-            let (pred_out, state_next) = prediction_net.step(last_token, &state)?;
-            let (token_logits, dur_logits) = joint.forward(&enc_frame, &pred_out)?;
-
-            let k = token_logits.argmax(D::Minus1)?.to_scalar::<u32>()?;
-            let dur_idx = dur_logits.argmax(D::Minus1)?.to_scalar::<u32>()? as usize;
-
-            step_count += 1;
-
-            // Periodic Metal pool flush — БЕЗ synchronize (он блокирует поток).
-            // flush_buffers возвращает unused buffers в pool, не дожидаясь GPU.
-            if step_count % 16 == 0 && device.is_metal() {
-                let _ = device.flush_buffers();
+            // P0a: пересчитываем predictor только при изменении last_token.
+            if pred_dirty {
+                let (po, sn) = prediction_net.step(last_token, &state)?;
+                pred_out_cached = Some(po);
+                state = sn;
+                pred_dirty = false;
             }
+            let pred_out = pred_out_cached.as_ref().unwrap();
+
+            // P1: используем закешированный enc_h для текущего фрейма.
+            let enc_h_frame = enc_h_all.i(time_idx)?;
+            let (token_logits, dur_logits) =
+                joint.forward_with_cached_enc(&enc_h_frame, pred_out)?;
+
+            // P4 — combined sync: вместо 2× to_scalar (2 GPU→CPU блокирующих transfer'а)
+            // делаем 1 transfer через stack([token_argmax, dur_argmax]) + to_vec1.
+            // Bit-exact, но в 2 раза меньше syncs per frame.
+            let token_argmax = token_logits.argmax_keepdim(D::Minus1)?;
+            let dur_argmax = dur_logits.argmax_keepdim(D::Minus1)?;
+            let combined = Tensor::cat(&[&token_argmax, &dur_argmax], 0)?;
+            let v: Vec<u32> = combined.flatten_all()?.to_vec1()?;
+            let k = v[0];
+            let dur_idx = v[1] as usize;
+
+            // Убран per-iter flush_buffers — он замусоривал hot path. Pool flush
+            // делается callsite декодера (см. parakeet_engine.rs::transcribe).
 
             let skip = if dur_idx < self.durations.len() {
                 self.durations[dur_idx]
@@ -111,6 +131,7 @@ impl TdtGreedyDecoder {
             };
 
             if k as usize == self.blank_idx {
+                // blank — pred остаётся валидным, кеш не сбрасываем
                 time_idx += skip.max(1);
             } else {
                 // subsampling_factor=8, window_stride=0.01 → 1 frame = 80мс
@@ -121,16 +142,31 @@ impl TdtGreedyDecoder {
                     cb(k, ts_ms);
                 }
                 last_token = k;
-                state = state_next;
+                // Non-blank emission: state уже обновлён в step() выше (sn → state),
+                // pred_dirty=true заставит пересчитать с новым last_token на следующей итерации.
+                pred_dirty = true;
 
                 if skip == 0 {
                     let mut symbols_added = 1;
                     while symbols_added < self.max_symbols_per_step {
-                        let (pred_out2, state_next2) = prediction_net.step(last_token, &state)?;
-                        let (token_logits2, dur_logits2) = joint.forward(&enc_frame, &pred_out2)?;
+                        // Каждый inner шаг требует свежего pred (last_token только что изменился).
+                        if pred_dirty {
+                            let (po2, sn2) = prediction_net.step(last_token, &state)?;
+                            pred_out_cached = Some(po2);
+                            state = sn2;
+                            pred_dirty = false;
+                        }
+                        let pred_out2 = pred_out_cached.as_ref().unwrap();
+                        let (token_logits2, dur_logits2) =
+                            joint.forward_with_cached_enc(&enc_h_frame, pred_out2)?;
 
-                        let k2 = token_logits2.argmax(D::Minus1)?.to_scalar::<u32>()?;
-                        let dur_idx2 = dur_logits2.argmax(D::Minus1)?.to_scalar::<u32>()? as usize;
+                        // Combined sync (см. главный loop выше)
+                        let token_argmax2 = token_logits2.argmax_keepdim(D::Minus1)?;
+                        let dur_argmax2 = dur_logits2.argmax_keepdim(D::Minus1)?;
+                        let combined2 = Tensor::cat(&[&token_argmax2, &dur_argmax2], 0)?;
+                        let v2: Vec<u32> = combined2.flatten_all()?.to_vec1()?;
+                        let k2 = v2[0];
+                        let dur_idx2 = v2[1] as usize;
                         let skip2 = if dur_idx2 < self.durations.len() {
                             self.durations[dur_idx2]
                         } else {
@@ -148,7 +184,7 @@ impl TdtGreedyDecoder {
                             cb(k2, ts_ms);
                         }
                         last_token = k2;
-                        state = state_next2;
+                        pred_dirty = true;
                         symbols_added += 1;
 
                         if skip2 > 0 {
