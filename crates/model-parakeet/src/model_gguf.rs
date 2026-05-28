@@ -42,10 +42,28 @@ pub struct ParakeetModelGguf {
 }
 
 impl ParakeetModelGguf {
-    /// Загрузить Parakeet из Q8 GGUF файла.
+    /// Загрузить Parakeet Q8 GGUF.
+    /// Default: F16 dequant (memory win ~1GB vs F32). На CPU использует F32.
     pub fn load(path: impl AsRef<Path>, device: &Device) -> AsrResult<Self> {
+        let dtype = if device.is_metal() || device.is_cuda() {
+            DType::F16
+        } else {
+            DType::F32
+        };
+        Self::load_with_dtype(path, device, dtype)
+    }
+
+    /// Загрузить с указанным dtype для матричных весов.
+    /// - F32: безопасно, baseline ~2.7GB phys footprint
+    /// - F16: вдвое меньше памяти, требует чтобы все Metal ops работали с F16
+    ///   (после refactor'а softmax/sigmoid/silu — должно работать)
+    pub fn load_with_dtype(
+        path: impl AsRef<Path>,
+        device: &Device,
+        target_dtype: DType,
+    ) -> AsrResult<Self> {
         let path = path.as_ref();
-        info!("Loading Parakeet Q8 GGUF: {:?}", path);
+        info!("Loading Parakeet Q8 GGUF: {:?} (target_dtype={:?})", path, target_dtype);
         let t0 = Instant::now();
 
         let gguf = ParakeetGguf::from_file(path, device)
@@ -55,19 +73,19 @@ impl ParakeetModelGguf {
 
         let config = gguf.config.clone();
 
-        // Mel extractor из preprocessor.fb + preprocessor.window (на CPU — FFT там)
+        // Mel extractor из preprocessor.fb + preprocessor.window (CPU FFT)
         let mel_extractor = build_mel_extractor(&gguf, &config)
             .map_err(|e| asr_core::AsrError::Model(format!("build_mel_extractor: {e}")))?;
 
-        // Remap GGUF tensors → safetensors-style HashMap для VarBuilder
+        // Remap GGUF tensors → safetensors-style HashMap, dequant в target_dtype
         let t1 = Instant::now();
-        let tensors_map = remap_tensors_to_safetensors_style(gguf, device)
+        let tensors_map = remap_tensors_to_safetensors_style(gguf, device, target_dtype)
             .map_err(|e| asr_core::AsrError::Model(format!("remap_tensors: {e}")))?;
         let remap_ms = t1.elapsed().as_millis();
-        debug!("Remap {} тензоров за {} мс", tensors_map.len(), remap_ms);
+        debug!("Remap {} тензоров за {} мс (dtype={:?})",
+            tensors_map.len(), remap_ms, target_dtype);
 
-        // Build VarBuilder (dtype F32 — наш encoder/decoder/joint грузят в F32 default)
-        let vb = VarBuilder::from_tensors(tensors_map, DType::F32, device);
+        let vb = VarBuilder::from_tensors(tensors_map, target_dtype, device);
 
         // Загрузить через existing структуры (наш encoder ожидает префикс "encoder",
         // decoder.prediction.*, joint.* — соответствует remapped именам).
@@ -223,11 +241,13 @@ fn map_gguf_name_to_safetensors(name: &str) -> Option<String> {
     Some(name.to_string())
 }
 
-/// Dequantize все Q8 тензоры → F32 (для совместимости с existing загрузчиками),
-/// remap names в safetensors-style, вернуть HashMap для VarBuilder::from_tensors.
+/// Dequantize все Q8 тензоры с указанным `target_dtype`.
+/// - `target_dtype=F32`: совместимость с existing safetensors-loaders (memory expensive: Q8→F32 ×4 размер)
+/// - `target_dtype=F16`: ×2 экономия на load и в RAM (Phase 3a — требует F16-compat ops в encoder)
 fn remap_tensors_to_safetensors_style(
     gguf: ParakeetGguf,
     device: &Device,
+    target_dtype: DType,
 ) -> Result<HashMap<String, Tensor>> {
     let mut out = HashMap::with_capacity(gguf.tensors.len());
     for (gguf_name, gt) in gguf.tensors.into_iter() {
@@ -235,20 +255,42 @@ fn remap_tensors_to_safetensors_style(
             Some(m) => m,
             None => continue,
         };
-        // Q8 dequant — в F32 (наши existing загрузчики ожидают F32).
-        // Phase 3: использовать QMatMul + F16 dequant для меньшей памяти.
         let t = match gt {
-            GgufTensor::Quantized(qt) => qt.dequantize(device)?,
+            GgufTensor::Quantized(qt) => {
+                // F16 dequant если target_dtype=F16 (×2 быстрее + ×2 меньше RAM)
+                if target_dtype == DType::F16 {
+                    qt.dequantize_f16(device)?
+                } else {
+                    qt.dequantize(device)?
+                }
+            }
             GgufTensor::Regular(t) => {
-                // F16 → F32 для совместимости
-                if t.dtype() == DType::F16 {
-                    t.to_dtype(DType::F32)?
+                if t.dtype() != target_dtype {
+                    t.to_dtype(target_dtype)?
                 } else {
                     t
                 }
             }
         };
-        out.insert(mapped, t);
+        // BatchNorm running_mean/running_var ВСЕГДА должны быть F32 (numerical stability).
+        // LayerNorm weights тоже желательно F32. Принудительно kept в F32 даже если target=F16.
+        let final_t = if needs_f32(&mapped) && t.dtype() != DType::F32 {
+            t.to_dtype(DType::F32)?
+        } else {
+            t
+        };
+        out.insert(mapped, final_t);
     }
     Ok(out)
+}
+
+/// Тензоры которые ОБЯЗАНЫ остаться F32 (numerical stability в norms / running stats).
+/// НЕ применять к Linear biases — там нужен match с весами (F16 weight + F32 bias = mismatch).
+fn needs_f32(name: &str) -> bool {
+    name.contains("batch_norm.running_mean")
+        || name.contains("batch_norm.running_var")
+        || name.contains("batch_norm.weight")
+        || name.contains("batch_norm.bias")
+        // LayerNorm weight/bias only (содержат "norm_ff1", "norm_self_att", "norm_conv", "norm_out")
+        || (name.contains(".norm_") && (name.ends_with(".weight") || name.ends_with(".bias")))
 }

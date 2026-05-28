@@ -47,8 +47,11 @@ struct LayerNorm {
 
 impl LayerNorm {
     fn load(dim: usize, vb: VarBuilder) -> Result<Self> {
-        let weight = vb.get(dim, "weight")?;
-        let bias = vb.get(dim, "bias")?;
+        // Force F32 для weight/bias чтобы norm computation корректно работала
+        // с любым input dtype (F32/F16). VarBuilder с dtype=F16 cast'ит на get()
+        // обратно в F16, что ломает numerical stability в norm.
+        let weight = vb.get(dim, "weight")?.to_dtype(candle_core::DType::F32)?;
+        let bias = vb.get(dim, "bias")?.to_dtype(candle_core::DType::F32)?;
         Ok(Self {
             weight,
             bias,
@@ -59,12 +62,25 @@ impl LayerNorm {
 
 impl Module for LayerNorm {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let mean = x.mean_keepdim(candle_core::D::Minus1)?;
-        let x_centered = x.broadcast_sub(&mean)?;
+        // F16 eps=1e-5 underflows (F16 min normal ≈ 6e-5). Считаем mean/var/std в F32,
+        // потом cast обратно в исходный dtype. weight/bias уже F32.
+        let in_dtype = x.dtype();
+        let x_f32 = if in_dtype == candle_core::DType::F32 {
+            x.clone()
+        } else {
+            x.to_dtype(candle_core::DType::F32)?
+        };
+        let mean = x_f32.mean_keepdim(candle_core::D::Minus1)?;
+        let x_centered = x_f32.broadcast_sub(&mean)?;
         let var = x_centered.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
         let std = (var + self.eps)?.sqrt()?;
         let norm = x_centered.broadcast_div(&std)?;
-        norm.broadcast_mul(&self.weight)?.broadcast_add(&self.bias)
+        let scaled = norm.broadcast_mul(&self.weight)?.broadcast_add(&self.bias)?;
+        if in_dtype == candle_core::DType::F32 {
+            Ok(scaled)
+        } else {
+            scaled.to_dtype(in_dtype)
+        }
     }
 }
 
@@ -82,10 +98,11 @@ struct BatchNorm1d {
 
 impl BatchNorm1d {
     fn load(dim: usize, vb: VarBuilder) -> Result<Self> {
-        let weight = vb.get(dim, "weight")?;
-        let bias = vb.get(dim, "bias")?;
-        let running_mean = vb.get(dim, "running_mean")?;
-        let running_var = vb.get(dim, "running_var")?;
+        // Force F32 stats — running_var/mean precision критична, не должна быть F16
+        let weight = vb.get(dim, "weight")?.to_dtype(candle_core::DType::F32)?;
+        let bias = vb.get(dim, "bias")?.to_dtype(candle_core::DType::F32)?;
+        let running_mean = vb.get(dim, "running_mean")?.to_dtype(candle_core::DType::F32)?;
+        let running_var = vb.get(dim, "running_var")?.to_dtype(candle_core::DType::F32)?;
         Ok(Self {
             weight,
             bias,
@@ -96,17 +113,30 @@ impl BatchNorm1d {
     }
 
     /// Forward для инференса: x [batch, channels, time].
+    /// Stats (running_mean/var/weight/bias) — F32, x может быть F16. Считаем в F32.
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let in_dtype = x.dtype();
+        let x_f32 = if in_dtype == candle_core::DType::F32 {
+            x.clone()
+        } else {
+            x.to_dtype(candle_core::DType::F32)?
+        };
         let mean = self.running_mean.reshape((1, (), 1))?;
         let var = self.running_var.reshape((1, (), 1))?;
         let w = self.weight.reshape((1, (), 1))?;
         let b = self.bias.reshape((1, (), 1))?;
 
         let std = (var + self.eps)?.sqrt()?;
-        x.broadcast_sub(&mean)?
+        let result = x_f32
+            .broadcast_sub(&mean)?
             .broadcast_div(&std)?
             .broadcast_mul(&w)?
-            .broadcast_add(&b)
+            .broadcast_add(&b)?;
+        if in_dtype == candle_core::DType::F32 {
+            Ok(result)
+        } else {
+            result.to_dtype(in_dtype)
+        }
     }
 }
 
@@ -415,9 +445,9 @@ impl RelPositionMultiHeadAttention {
         // [B, H, T, 2T-1] → rel_shift → [B, H, T, T]
         let pos_score = self.rel_shift(&pos_score_full, t)?;
 
-        // Суммарный score
+        // Суммарный score — .affine(1/scale, 0) сохраняет dtype (vs `/scale` промотит F16→F32)
         let scale = (dk as f64).sqrt();
-        let scores = (content_score + pos_score)? / scale;
+        let scores = (content_score + pos_score)?.affine(1.0 / scale, 0.0);
 
         // Softmax + Attention
         // softmax_last_dim: Metal kernel есть в reduce.metal, но CustomOp1 не зарегистрирован
@@ -533,12 +563,12 @@ impl ConformerConvolution {
         let x = x.conv1d(&self.pointwise_conv1_w, 0, 1, 1, 1)?;
 
         // GLU: разбиваем пополам по dim=1, gate = sigmoid(b)
-        // Activation::Sigmoid — custom op без Metal impl. Tensor::neg + exp + + + recip даёт sigmoid через базовые ops.
+        // sigmoid(x) = 1 / (1 + exp(-x)). Используем affine(1.0, 1.0) который
+        // сохраняет dtype (vs `+ 1.0` который промотит scalar в F32).
         let half = self.d_model;
         let a = x.narrow(1, 0, half)?;
         let b = x.narrow(1, half, half)?;
-        // sigmoid(x) = 1 / (1 + exp(-x))
-        let b_sig = (b.neg()?.exp()? + 1.0)?.recip()?;
+        let b_sig = b.neg()?.exp()?.affine(1.0, 1.0)?.recip()?;
         let x = (a * b_sig)?;
 
         // Depthwise Conv1d: padding = kernel_size / 2, groups = D
@@ -615,7 +645,7 @@ impl ConformerLayer {
             let f = ff1_out.flatten_all()?;
             eprintln!("[layer-debug] ff1: [{:.2}, {:.2}]", f.min(0)?.to_scalar::<f32>()?, f.max(0)?.to_scalar::<f32>()?);
         }
-        let x = (residual + (ff1_out * 0.5)?)?;
+        let x = (residual + ff1_out.affine(0.5, 0.0)?)?;
 
         // 2. Self-Attention
         let residual = &x;
@@ -642,7 +672,7 @@ impl ConformerLayer {
             let f = ff2_out.flatten_all()?;
             eprintln!("[layer-debug] ff2: [{:.2}, {:.2}]", f.min(0)?.to_scalar::<f32>()?, f.max(0)?.to_scalar::<f32>()?);
         }
-        let x = (residual + (ff2_out * 0.5)?)?;
+        let x = (residual + ff2_out.affine(0.5, 0.0)?)?;
 
         // 5. Final LayerNorm
         self.norm_out.forward(&x)
@@ -687,26 +717,30 @@ impl FastConformerEncoder {
     /// Forward: mel [1, n_mels, time] → encoder_output [1, T/8, d_model].
     pub fn forward(&self, mel: &Tensor) -> Result<Tensor> {
         let device = mel.device().clone();
-        // Cast mel в dtype весов: на CPU/Metal F32, на CUDA BF16. Без cast'а
-        // BF16-веса × F32-mel падают в conv2d_manual (см. парный фикс LSTM
-        // state в decoder, коммит 2d090e9).
+        let target_dtype = self.subsampling.weight_dtype();
         let x = mel
             .permute((0, 2, 1))?
             .unsqueeze(1)?
-            .to_dtype(self.subsampling.weight_dtype())?; // [B, 1, T, D]
+            .to_dtype(target_dtype)?;
 
         // Subsampling: [B, 1, T, D] → [B, T/8, d_model]
         let x = self.subsampling.forward(&x)?;
         flush_metal_pool(&device);
 
-        // Positional encoding
+        // Positional encoding (pos_emb создаётся в F32, cast в dtype весов
+        // чтобы избежать F32×F16 mismatch в attention.linear_pos на Metal)
         let (x, pos_emb) = self.pos_enc.forward(&x)?;
+        let weight_dtype = self.subsampling.weight_dtype();
+        let pos_emb = if pos_emb.dtype() != weight_dtype {
+            pos_emb.to_dtype(weight_dtype)?
+        } else {
+            pos_emb
+        };
 
         // N × ConformerLayer с periodic flush (аналог Qwen3-ASR per-step flush)
         let mut x = x;
         for (i, layer) in self.layers.iter().enumerate() {
             x = layer.forward(&x, &pos_emb)?;
-            // Flush каждые 4 layer — баланс между fragmentation и overhead
             if (i + 1) % 4 == 0 {
                 flush_metal_pool(&device);
             }

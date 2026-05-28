@@ -85,11 +85,12 @@ impl LstmLayer {
         let g_gate = gates.narrow(D::Minus1, 2 * hs, hs)?;
         let o_gate = gates.narrow(D::Minus1, 3 * hs, hs)?;
 
-        // sigmoid через базовые ops для Metal compat: 1/(1+exp(-x))
-        let i_gate = (i_gate.neg()?.exp()? + 1.0)?.recip()?;
-        let f_gate = (f_gate.neg()?.exp()? + 1.0)?.recip()?;
+        // sigmoid через базовые ops + .affine(1.0, 1.0) сохраняет dtype (vs `+ 1.0`
+        // который промотит F16 в F32 mismatch).
+        let i_gate = i_gate.neg()?.exp()?.affine(1.0, 1.0)?.recip()?;
+        let f_gate = f_gate.neg()?.exp()?.affine(1.0, 1.0)?.recip()?;
         let g_gate = g_gate.tanh()?;
-        let o_gate = (o_gate.neg()?.exp()? + 1.0)?.recip()?;
+        let o_gate = o_gate.neg()?.exp()?.affine(1.0, 1.0)?.recip()?;
 
         // c_new = f * c + i * g
         let c_new = (f_gate * c)?.broadcast_add(&(i_gate * g_gate)?)?;

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use asr_core::{AsrModel, TranscribeOptions};
-use candle_core::{Device, IndexOp, D};
+use candle_core::{DType, Device, IndexOp, D};
 use model_parakeet::ParakeetModelGguf;
 
 const GGUF_PATH: &str = "/tmp/parakeet-gguf/parakeet-q8_0.gguf";
@@ -145,8 +145,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let device = Device::new_metal(0).map_err(|e| format!("Metal init: {e}"))?;
 
+    // Управление dtype через env: PARAKEET_DTYPE=f32 → F32, default F16 (memory win)
+    let dtype = match std::env::var("PARAKEET_DTYPE").ok().as_deref() {
+        Some("f32") | Some("F32") => DType::F32,
+        _ => DType::F16,
+    };
+    println!("Target dtype: {:?}", dtype);
+
     let load_t0 = Instant::now();
-    let model = ParakeetModelGguf::load(GGUF_PATH, &device)?;
+    let model = ParakeetModelGguf::load_with_dtype(GGUF_PATH, &device, dtype)?;
     let load_ms = load_t0.elapsed().as_millis();
 
     let phys_after_load = process_phys_footprint_mb().unwrap_or(0);
