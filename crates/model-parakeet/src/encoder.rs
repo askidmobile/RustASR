@@ -699,8 +699,6 @@ impl FastConformerEncoder {
                 flush_metal_pool(&device);
             }
         }
-        // Cast в F32 для TDT decoder (joint/LSTM работают в F32 точности)
-        let x = x.to_dtype(candle_core::DType::F32)?;
         flush_metal_pool(&device);
         Ok(x)
     }

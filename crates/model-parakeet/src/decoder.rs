@@ -108,13 +108,18 @@ pub struct LstmState {
 }
 
 impl LstmState {
-    /// Создать нулевое начальное состояние.
-    pub fn zeros(num_layers: usize, hidden_size: usize, device: &Device) -> Result<Self> {
+    /// Создать нулевое начальное состояние с указанным dtype (должен совпадать с весами).
+    pub fn zeros(
+        num_layers: usize,
+        hidden_size: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Self> {
         let mut h = Vec::with_capacity(num_layers);
         let mut c = Vec::with_capacity(num_layers);
         for _ in 0..num_layers {
-            h.push(Tensor::zeros(hidden_size, DType::F32, device)?);
-            c.push(Tensor::zeros(hidden_size, DType::F32, device)?);
+            h.push(Tensor::zeros(hidden_size, dtype, device)?);
+            c.push(Tensor::zeros(hidden_size, dtype, device)?);
         }
         Ok(Self { h, c })
     }
@@ -168,9 +173,10 @@ impl PredictionNet {
         })
     }
 
-    /// Начальное состояние LSTM.
+    /// Начальное состояние LSTM (dtype = dtype весов).
     pub fn initial_state(&self, device: &Device) -> Result<LstmState> {
-        LstmState::zeros(self.num_layers, self.hidden_size, device)
+        let dtype = self.embedding.dtype();
+        LstmState::zeros(self.num_layers, self.hidden_size, dtype, device)
     }
 
     /// Forward одного шага: token_id → (output [hidden], new_state).
