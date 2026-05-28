@@ -674,17 +674,21 @@ impl FastConformerEncoder {
 
     /// Forward: mel [1, n_mels, time] → encoder_output [1, T/8, d_model].
     pub fn forward(&self, mel: &Tensor) -> Result<Tensor> {
-        // NeMo: transpose(1,2) mel [B,D,T] → [B,T,D], потом unsqueeze → [B,1,T,D]
-        // Conv2d: dim2=time(T), dim3=freq(D)
+        // Cast mel в dtype весов (F16 на Metal, BF16 на CUDA, F32 на CPU)
+        let target_dtype = self.subsampling.weight_dtype();
         let device = mel.device().clone();
-        let x = mel.permute((0, 2, 1))?.unsqueeze(1)?; // [B, 1, T, D]
+        let x = mel
+            .to_dtype(target_dtype)?
+            .permute((0, 2, 1))?
+            .unsqueeze(1)?; // [B, 1, T, D]
 
         // Subsampling: [B, 1, T, D] → [B, T/8, d_model]
         let x = self.subsampling.forward(&x)?;
         flush_metal_pool(&device);
 
-        // Positional encoding
+        // Positional encoding (cast в dtype весов — pos_emb создаётся в F32)
         let (x, pos_emb) = self.pos_enc.forward(&x)?;
+        let pos_emb = pos_emb.to_dtype(target_dtype)?;
 
         // N × ConformerLayer с periodic flush (аналог Qwen3-ASR per-step flush)
         let mut x = x;
@@ -695,6 +699,8 @@ impl FastConformerEncoder {
                 flush_metal_pool(&device);
             }
         }
+        // Cast в F32 для TDT decoder (joint/LSTM работают в F32 точности)
+        let x = x.to_dtype(candle_core::DType::F32)?;
         flush_metal_pool(&device);
         Ok(x)
     }

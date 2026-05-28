@@ -52,17 +52,21 @@ impl ParakeetMelExtractor {
         let hop_length = config.hop_length();
         let win_length = config.win_length();
 
-        // Извлечь mel-фильтры: [1, n_mels, n_fft/2+1] → [n_mels][n_fft/2+1]
-        let fb_data = mel_fb.squeeze(0)?.to_vec2::<f32>()?;
+        // Извлечь mel-фильтры: cast в F32 (FFT operations требуют F32, веса могут быть F16)
+        use candle_core::DType;
+        let fb_data = mel_fb
+            .squeeze(0)?
+            .to_dtype(DType::F32)?
+            .to_vec2::<f32>()?;
         assert_eq!(
             fb_data.len(),
             n_mels,
             "mel_filters: ожидается {n_mels} бинов"
         );
 
-        // Извлечь окно или сгенерировать Hann
+        // Извлечь окно или сгенерировать Hann (cast в F32 если F16)
         let window = if let Some(w) = window_tensor {
-            w.to_vec1::<f32>()?
+            w.to_dtype(DType::F32)?.to_vec1::<f32>()?
         } else {
             hann_window(win_length)
         };
