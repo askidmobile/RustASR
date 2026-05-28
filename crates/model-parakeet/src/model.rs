@@ -32,7 +32,7 @@ pub struct ParakeetModel {
     pub joint: JointNetwork,
     pub tdt_decoder: TdtGreedyDecoder,
     mel_extractor: ParakeetMelExtractor,
-    pub(crate) tokenizer: SentencePieceTokenizer,
+    tokenizer: SentencePieceTokenizer,
     device: Device,
     config: ParakeetConfig,
     model_dir: PathBuf,

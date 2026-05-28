@@ -7,7 +7,7 @@
 //! - RelPositionMultiHeadAttention: pos_bias_u/v + rel_shift
 //! - ConformerConvolution: pointwise → GLU → depthwise → BN → SiLU → pointwise
 
-use candle_core::{Device, IndexOp, Module, Result, Tensor};
+use candle_core::{Device, Module, Result, Tensor};
 
 /// Освобождение Metal buffer pool — аналог Qwen3-ASR pipeline.
 fn flush_metal_pool(device: &Device) {

@@ -11,7 +11,7 @@
 //! - decoder.prediction.dec_rnn.lstm.bias_ih_l{i}: [4*hidden]
 //! - decoder.prediction.dec_rnn.lstm.bias_hh_l{i}: [4*hidden]
 
-use candle_core::{D, DType, Device, Module, Result, Tensor};
+use candle_core::{D, DType, Device, Result, Tensor};
 use candle_nn::VarBuilder;
 use tracing::debug;
 
@@ -132,7 +132,6 @@ pub struct PredictionNet {
     lstm_layers: Vec<LstmLayer>,
     hidden_size: usize,
     num_layers: usize,
-    blank_idx: usize,
 }
 
 impl PredictionNet {
@@ -170,7 +169,6 @@ impl PredictionNet {
             lstm_layers,
             hidden_size: config.pred_hidden,
             num_layers: config.num_lstm_layers,
-            blank_idx: config.blank_idx,
         })
     }
 
