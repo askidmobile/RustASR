@@ -98,9 +98,9 @@ impl TdtGreedyDecoder {
 
             step_count += 1;
 
-            // Periodic Metal pool flush — аналог Qwen3-ASR per-step flush
-            if step_count % 8 == 0 && device.is_metal() {
-                let _ = device.synchronize();
+            // Periodic Metal pool flush — БЕЗ synchronize (он блокирует поток).
+            // flush_buffers возвращает unused buffers в pool, не дожидаясь GPU.
+            if step_count % 16 == 0 && device.is_metal() {
                 let _ = device.flush_buffers();
             }
 
