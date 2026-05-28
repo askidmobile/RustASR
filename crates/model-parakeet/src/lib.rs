@@ -10,7 +10,9 @@ pub mod gguf;
 pub mod joint;
 pub mod mel;
 pub mod model;
+pub mod model_gguf;
 pub mod tdt;
 
 pub use gguf::{GgufTensor, ParakeetGguf};
 pub use model::ParakeetModel;
+pub use model_gguf::ParakeetModelGguf;
