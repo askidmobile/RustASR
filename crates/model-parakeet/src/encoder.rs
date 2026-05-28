@@ -414,7 +414,9 @@ impl RelPositionMultiHeadAttention {
         let scores = (content_score + pos_score)? / scale;
 
         // Softmax + Attention
-        let attn = candle_nn::ops::softmax_last_dim(&scores?)?;
+        // candle_nn::ops::softmax_last_dim — custom op без Metal impl.
+        // Используем ::softmax (через общие ops: max/sub/exp/sum/div) который работает на Metal.
+        let attn = candle_nn::ops::softmax(&scores?, candle_core::D::Minus1)?;
         let context = attn.matmul(&v.contiguous()?)?;
 
         // Reshape: [B, H, T, dk] → [B, T, D]
@@ -477,7 +479,7 @@ impl ConformerFeedForward {
 impl Module for ConformerFeedForward {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let h = self.linear1.forward(x)?;
-        let h = candle_nn::Activation::Silu.forward(&h)?;
+        let h = h.silu()?;
         self.linear2.forward(&h)
     }
 }
@@ -524,10 +526,13 @@ impl ConformerConvolution {
         let x = x.conv1d(&self.pointwise_conv1_w, 0, 1, 1, 1)?;
 
         // GLU: разбиваем пополам по dim=1, gate = sigmoid(b)
+        // Activation::Sigmoid — custom op без Metal impl. Tensor::neg + exp + + + recip даёт sigmoid через базовые ops.
         let half = self.d_model;
         let a = x.narrow(1, 0, half)?;
         let b = x.narrow(1, half, half)?;
-        let x = (a * candle_nn::Activation::Sigmoid.forward(&b)?)?;
+        // sigmoid(x) = 1 / (1 + exp(-x))
+        let b_sig = (b.neg()?.exp()? + 1.0)?.recip()?;
+        let x = (a * b_sig)?;
 
         // Depthwise Conv1d: padding = kernel_size / 2, groups = D
         let pad = self.kernel_size / 2;
@@ -536,8 +541,8 @@ impl ConformerConvolution {
         // BatchNorm1d
         let x = self.batch_norm.forward(&x)?;
 
-        // SiLU
-        let x = candle_nn::Activation::Silu.forward(&x)?;
+        // SiLU (через tensor метод — Activation custom op без Metal impl)
+        let x = x.silu()?;
 
         // Pointwise Conv1d: [B, D, T] → [B, D, T]
         let x = x.conv1d(&self.pointwise_conv2_w, 0, 1, 1, 1)?;
@@ -674,21 +679,15 @@ impl FastConformerEncoder {
 
     /// Forward: mel [1, n_mels, time] → encoder_output [1, T/8, d_model].
     pub fn forward(&self, mel: &Tensor) -> Result<Tensor> {
-        // Cast mel в dtype весов (F16 на Metal, BF16 на CUDA, F32 на CPU)
-        let target_dtype = self.subsampling.weight_dtype();
         let device = mel.device().clone();
-        let x = mel
-            .to_dtype(target_dtype)?
-            .permute((0, 2, 1))?
-            .unsqueeze(1)?; // [B, 1, T, D]
+        let x = mel.permute((0, 2, 1))?.unsqueeze(1)?; // [B, 1, T, D]
 
         // Subsampling: [B, 1, T, D] → [B, T/8, d_model]
         let x = self.subsampling.forward(&x)?;
         flush_metal_pool(&device);
 
-        // Positional encoding (cast в dtype весов — pos_emb создаётся в F32)
+        // Positional encoding
         let (x, pos_emb) = self.pos_enc.forward(&x)?;
-        let pos_emb = pos_emb.to_dtype(target_dtype)?;
 
         // N × ConformerLayer с periodic flush (аналог Qwen3-ASR per-step flush)
         let mut x = x;

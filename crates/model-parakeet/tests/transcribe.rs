@@ -287,6 +287,66 @@ fn test_parakeet_streaming() {
 }
 
 // ============================================================================
+// Тест: реальное короткое аудио из прода (3с микрофонный chunk)
+// ============================================================================
+
+#[test]
+fn test_parakeet_prod_3s_chunk() {
+    let model_path = match get_model_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("SKIP: Parakeet model not found");
+            return;
+        }
+    };
+
+    let wav_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("test_prod_3s.wav");
+
+    if !wav_path.exists() {
+        eprintln!("SKIP: test_prod_3s.wav not found");
+        return;
+    }
+
+    // ХАРДКОД Metal — повторяем prod scenario где F16 + Metal ломалось
+    let device = Device::new_metal(0).expect("Metal init failed (нужен Apple Silicon)");
+    eprintln!("Device: Metal GPU");
+    let mut model = ParakeetModel::load(&model_path, &device).expect("Load failed");
+
+    let samples = load_wav(wav_path.to_str().unwrap());
+    eprintln!(
+        "Prod 3s audio: {} samples, duration={:.2}s",
+        samples.len(),
+        samples.len() as f64 / 16000.0
+    );
+
+    let start = Instant::now();
+    let result = model.transcribe(&samples, &default_options());
+    let elapsed = start.elapsed();
+
+    match result {
+        Ok(r) => {
+            let rtf = elapsed.as_secs_f64() / (samples.len() as f64 / 16000.0);
+            eprintln!(
+                "Prod 3s result: \"{}\" ({:.0}ms, RTF={:.3})",
+                r.text,
+                elapsed.as_millis(),
+                rtf,
+            );
+            assert!(
+                !r.text.trim().is_empty(),
+                "Parakeet вернул ПУСТОЙ текст для прод 3с аудио — баг с F16/precision!"
+            );
+        }
+        Err(e) => panic!("Prod transcription FAILED: {}", e),
+    }
+}
+
+// ============================================================================
 // Тест 5: TDT decoder с NeMo encoder output (bypass encoder)
 // ============================================================================
 

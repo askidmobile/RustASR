@@ -119,12 +119,10 @@ impl ParakeetModel {
             )));
         }
 
-        // F16 на Metal (вдвое меньше памяти, нативная поддержка),
-        // BF16 на CUDA, F32 на CPU.
-        // Mel extractor сам cast'ит фильтры в F32 (FFT требует F32).
-        let dtype = if device.is_metal() {
-            DType::F16
-        } else if device.is_cuda() {
+        // F32 на Metal/CPU — Metal F16 поддержка в candle неполная
+        // (нет softmax, sigmoid, и др. F16 ops). Quantization — отдельная задача.
+        // BF16 только на CUDA.
+        let dtype = if device.is_cuda() {
             DType::BF16
         } else {
             DType::F32

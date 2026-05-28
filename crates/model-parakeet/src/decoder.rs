@@ -85,10 +85,11 @@ impl LstmLayer {
         let g_gate = gates.narrow(D::Minus1, 2 * hs, hs)?;
         let o_gate = gates.narrow(D::Minus1, 3 * hs, hs)?;
 
-        let i_gate = candle_nn::Activation::Sigmoid.forward(&i_gate)?;
-        let f_gate = candle_nn::Activation::Sigmoid.forward(&f_gate)?;
+        // sigmoid через базовые ops для Metal compat: 1/(1+exp(-x))
+        let i_gate = (i_gate.neg()?.exp()? + 1.0)?.recip()?;
+        let f_gate = (f_gate.neg()?.exp()? + 1.0)?.recip()?;
         let g_gate = g_gate.tanh()?;
-        let o_gate = candle_nn::Activation::Sigmoid.forward(&o_gate)?;
+        let o_gate = (o_gate.neg()?.exp()? + 1.0)?.recip()?;
 
         // c_new = f * c + i * g
         let c_new = (f_gate * c)?.broadcast_add(&(i_gate * g_gate)?)?;
@@ -173,11 +174,13 @@ impl PredictionNet {
         })
     }
 
-    /// Начальное состояние LSTM (dtype = dtype весов).
+    /// Начальное состояние LSTM (dtype совпадает с весами для matmul).
     pub fn initial_state(&self, device: &Device) -> Result<LstmState> {
         let dtype = self.embedding.dtype();
         LstmState::zeros(self.num_layers, self.hidden_size, dtype, device)
     }
+    // Note: dtype-aware initial_state нужен на случай если когда-то добавим
+    // F16 path. Сейчас всё F32, но код безопасен и для будущих изменений.
 
     /// Forward одного шага: token_id → (output [hidden], new_state).
     ///
