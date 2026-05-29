@@ -20,6 +20,7 @@ use crate::decoder::PredictionNet;
 use crate::encoder::FastConformerEncoder;
 use crate::joint::JointNetwork;
 use crate::mel::ParakeetMelExtractor;
+use crate::model_gguf::ParakeetModelGguf;
 use crate::tdt::TdtGreedyDecoder;
 
 /// Максимальная длительность одного чанка в секундах.
@@ -91,13 +92,19 @@ impl SentencePieceTokenizer {
 impl ParakeetModel {
     /// Загрузить модель из директории.
     ///
-    /// Ожидаемые файлы:
-    /// - config.json
-    /// - model.safetensors
-    /// - vocab.json (или tokenizer.model)
+    /// Приоритет: `parakeet-q8_0.gguf` (Q8 GGUF с real QMatMul, peak ~1 ГБ RAM).
+    /// Fallback: `model.safetensors` (F32, peak ~2.5 ГБ RAM).
     pub fn load(model_dir: impl AsRef<Path>, device: &Device) -> AsrResult<Self> {
         let model_dir = model_dir.as_ref().to_path_buf();
-        info!("Загрузка Parakeet-TDT из {:?}", model_dir);
+
+        // Phase 3b: предпочитаем Q8 GGUF — production bundle с -1.6 ГБ memory win
+        let gguf_path = model_dir.join("parakeet-q8_0.gguf");
+        if gguf_path.exists() {
+            info!("Загрузка Parakeet Q8 GGUF из {:?}", gguf_path);
+            return Self::from_gguf_path(&gguf_path, device);
+        }
+
+        info!("Загрузка Parakeet-TDT safetensors из {:?}", model_dir);
 
         // 1. Загрузить конфигурацию
         let config_path = model_dir.join("config.json");
@@ -207,6 +214,39 @@ impl ParakeetModel {
         })
     }
 
+    /// Загрузить Parakeet из Q8 GGUF файла напрямую.
+    ///
+    /// GGUF содержит и веса, и config (parakeet.* metadata), и vocab
+    /// (tokenizer.ggml.tokens) — `config.json`/`vocab.json` не требуются.
+    pub fn from_gguf_path(gguf_path: impl AsRef<Path>, device: &Device) -> AsrResult<Self> {
+        let gguf_path = gguf_path.as_ref().to_path_buf();
+        let model_dir = gguf_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        let gguf_model = ParakeetModelGguf::load(&gguf_path, device)?;
+
+        info!(
+            "Parakeet Q8 GGUF загружен: {} токенов в vocab",
+            gguf_model.vocab.len()
+        );
+
+        Ok(Self {
+            encoder: gguf_model.encoder,
+            prediction_net: gguf_model.prediction_net,
+            joint: gguf_model.joint,
+            tdt_decoder: gguf_model.tdt_decoder,
+            mel_extractor: gguf_model.mel_extractor,
+            tokenizer: SentencePieceTokenizer {
+                vocab: gguf_model.vocab,
+            },
+            device: gguf_model.device,
+            config: gguf_model.config,
+            model_dir,
+        })
+    }
+
     /// Encode audio → encoder frames.
     fn encode_chunk(&self, samples: &[f32]) -> AsrResult<candle_core::Tensor> {
         let mel = self.mel_extractor.extract(samples, &self.device)?;
@@ -291,17 +331,27 @@ impl AsrModel for ParakeetModel {
     }
 
     fn model_info(&self) -> ModelInfo {
-        // Размер файла
-        let weights_size = std::fs::metadata(self.model_dir.join("model.safetensors"))
-            .map(|m| m.len())
-            .ok();
+        // GGUF (Q8) приоритет, fallback на safetensors
+        let gguf_path = self.model_dir.join("parakeet-q8_0.gguf");
+        let safetensors_path = self.model_dir.join("model.safetensors");
+        let (weights_size, quantization) = if gguf_path.exists() {
+            (
+                std::fs::metadata(&gguf_path).map(|m| m.len()).ok(),
+                QuantizationType::GgufQ8_0,
+            )
+        } else {
+            (
+                std::fs::metadata(&safetensors_path).map(|m| m.len()).ok(),
+                QuantizationType::None,
+            )
+        };
 
         ModelInfo {
             model_type: ModelType::Parakeet,
             display_name: "Parakeet-TDT v3 (0.6B)".to_string(),
             parameters: Some(627_090_606),
             weights_size_bytes: weights_size,
-            quantization: QuantizationType::None,
+            quantization,
             languages: self
                 .supported_languages()
                 .iter()
