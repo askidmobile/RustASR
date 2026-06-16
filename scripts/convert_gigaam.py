@@ -49,7 +49,13 @@ MODEL_HASHES = {
     "v3_e2e_ctc": "367074d6498f426d960b25f49531cf68",
 }
 
-# Конфигурация модели v3_e2e_ctc (из HuggingFace config.json)
+# Конфигурация модели v3_e2e_ctc.
+# Препроцессор ДОЛЖЕН совпадать с эталоном GigaAM (salute-developers/GigaAM,
+# gigaam/preprocess.py): win_length = n_fft = sample_rate // 40 = 400 (25 мс),
+# hop_length = sample_rate // 100 = 160 (10 мс), torchaudio.MelSpectrogram(
+# mel_scale='htk', norm=None, center=True), затем ln(clamp[1e-9, 1e9]).
+# РАНЕЕ здесь ошибочно стояли win_length=n_fft=320 и center=False — это давало
+# train/inference mismatch во входной статистике энкодера (тихий рост WER).
 GIGAAM_V3_E2E_CTC_CONFIG = {
     "model_name": "gigaam-v3-e2e-ctc",
     "model_class": "ctc",
@@ -57,12 +63,12 @@ GIGAAM_V3_E2E_CTC_CONFIG = {
     "preprocessor": {
         "sample_rate": 16000,
         "features": 64,
-        "win_length": 320,
+        "win_length": 400,
         "hop_length": 160,
-        "n_fft": 320,
+        "n_fft": 400,
         "mel_scale": "htk",
         "mel_norm": None,
-        "center": False,
+        "center": True,
     },
     "encoder": {
         "feat_in": 64,
