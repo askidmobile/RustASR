@@ -26,10 +26,13 @@
 //! - [ ] `model`   — сборка + impl AsrModel + parity против tmp/parity/nemotron_*.npy.
 
 pub mod config;
+pub mod decoder;
 pub mod encoder;
+pub mod joint;
 pub mod mel;
 pub mod model;
 pub mod prompt;
+pub mod tokenizer;
 
 pub use config::NemotronConfig;
 pub use encoder::NemotronEncoder;
