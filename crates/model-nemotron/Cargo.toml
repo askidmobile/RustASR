@@ -1,0 +1,33 @@
+[package]
+name = "model-nemotron"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "NVIDIA Nemotron 3.5 ASR Streaming 0.6B — FastConformer-CacheAware-RNNT + Lang prompt на чистом Rust (Candle)"
+
+[dependencies]
+# Внутренние крейты
+asr-core.workspace = true
+
+# ML бэкенд
+candle-core.workspace = true
+candle-nn.workspace = true
+candle-transformers.workspace = true
+safetensors.workspace = true
+
+# Сериализация
+serde.workspace = true
+serde_json.workspace = true
+
+# Ошибки и логирование
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+
+# FFT для mel-спектрограммы
+rustfft.workspace = true
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }

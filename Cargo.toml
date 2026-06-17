@@ -10,6 +10,7 @@ members = [
     "crates/model-whisper",
     "crates/model-gigaam",
     "crates/model-parakeet",
+    "crates/model-nemotron",
     "crates/model-qwen3",
     "crates/asr-engine",
 ]
@@ -33,6 +34,7 @@ qwen3-decoder = { path = "crates/qwen3-decoder" }
 model-whisper = { path = "crates/model-whisper" }
 model-gigaam = { path = "crates/model-gigaam" }
 model-parakeet = { path = "crates/model-parakeet" }
+model-nemotron = { path = "crates/model-nemotron" }
 model-qwen3 = { path = "crates/model-qwen3" }
 asr-engine = { path = "crates/asr-engine" }
 
