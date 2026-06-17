@@ -10,7 +10,7 @@
 //! Ф3 parity (tmp/parity/nemotron_*.npy): subsampling→pre_encode_out ✓,
 //! layers→layer0_out/layer1_out, full→encoded_pre_prompt.
 
-use candle_core::{DType, Result, Tensor, D};
+use candle_core::{Result, Tensor, D};
 use candle_nn::{Linear, Module, VarBuilder};
 
 use crate::config::EncoderConfig;
