@@ -184,6 +184,23 @@ impl NemotronModel {
         self.vocab.decode(tokens)
     }
 
+    /// Текущий язык prompt'а (индекс one-hot).
+    pub fn lang_idx(&self) -> usize {
+        self.lang_idx
+    }
+
+    /// Сменить язык prompt'а по коду (`ru`/`ru-RU`/`en`/`auto`/…). Для смешанного
+    /// RU/EN полезен `auto`. Возвращает true если код найден в prompt_dictionary.
+    pub fn set_language(&mut self, code: &str) -> bool {
+        match self.config.prompt.lang_idx(code) {
+            Some(idx) => {
+                self.lang_idx = idx;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Внутренний инференс → последовательность token id (без blank).
     fn transcribe_tokens(&self, samples: &[f32]) -> CandleResult<Vec<u32>> {
         let mel = self

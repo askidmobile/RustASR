@@ -68,10 +68,18 @@ def build_config(cfg) -> dict:
     except Exception:
         att = None
     prompt_dict = {}
-    try:
-        prompt_dict = dict(cfg.prompt_format_fn.prompt_dictionary) if hasattr(cfg, "prompt_format_fn") else {}
-    except Exception:
-        prompt_dict = {}
+    for path in ("model_defaults.prompt_dictionary", "prompt_format_fn.prompt_dictionary"):
+        try:
+            node = cfg
+            for k in path.split("."):
+                node = node[k]
+            from omegaconf import OmegaConf as _OC
+            d = _OC.to_container(node, resolve=True)
+            if d:
+                prompt_dict = d
+                break
+        except Exception:
+            pass
 
     return {
         "model_name": "nemotron-3.5-asr-streaming-0.6b",
