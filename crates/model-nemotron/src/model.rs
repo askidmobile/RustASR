@@ -64,8 +64,11 @@ impl NemotronModel {
         let vocab = SpVocab::from_json(&model_dir.join("vocab.json"))
             .map_err(|e| AsrError::Model(format!("vocab.json: {e}")))?;
 
-        let gguf = model_dir.join("model-q8_0.gguf");
-        let (vb, fb, window) = if gguf.exists() {
+        // NEMOTRON_FORCE_F32 / NEMOTRON_GGUF=<file> — для диагностики качества квантования.
+        let force_f32 = std::env::var("NEMOTRON_FORCE_F32").is_ok();
+        let gguf_name = std::env::var("NEMOTRON_GGUF").unwrap_or_else(|_| "model-q8_0.gguf".into());
+        let gguf = model_dir.join(&gguf_name);
+        let (vb, fb, window) = if !force_f32 && gguf.exists() {
             Self::weights_from_gguf(&gguf, device)?
         } else {
             Self::weights_from_safetensors(&model_dir.join("model.safetensors"), device)?

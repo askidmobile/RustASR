@@ -24,6 +24,9 @@ fn main() -> anyhow::Result<()> {
     }
     let input = &args[1];
     let output = &args[2];
+    // По умолчанию Q8 ТОЛЬКО энкодер (609M); joint/decoder/prompt в F16 — выше точность
+    // argmax (RNN-T тонкие margin'ы), +21МБ. 3-й арг "all" → квантовать всё.
+    let encoder_only = args.get(3).map(|s| s != "all").unwrap_or(true);
     let device = Device::Cpu;
 
     let tensors = candle_core::safetensors::load(input, &device)?;
@@ -36,7 +39,8 @@ fn main() -> anyhow::Result<()> {
 
     for (name, t) in tensors {
         let is_norm = name.contains("norm") || name.contains("layernorm");
-        let q8 = t.rank() == 2 && name.ends_with(".weight") && !is_norm;
+        let in_scope = !encoder_only || name.starts_with("encoder.");
+        let q8 = t.rank() == 2 && name.ends_with(".weight") && !is_norm && in_scope;
         if q8 {
             let qt = QTensor::quantize(&t, GgmlDType::Q8_0)?;
             bytes_q += t.elem_count(); // ~1 байт/элемент Q8_0 (+ overhead)
