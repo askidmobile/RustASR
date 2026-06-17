@@ -111,12 +111,14 @@ impl FeedForward {
     }
 }
 
-/// Синусоидальное rel-pos кодирование (Transformer-XL), позиции -(T-1)..+(T-1).
+/// Синусоидальное rel-pos кодирование (Transformer-XL).
+/// NeMo RelPositionalEncoding: позиции УБЫВАЮТ от +(T-1) до -(T-1)
+/// (pos_emb[0]=+(T-1), середина=0). Подтверждено parity к NeMo (dist 5.6e-08).
 fn rel_pos_emb(t: usize, d: usize, device: &candle_core::Device) -> Result<Tensor> {
     let pe_len = 2 * t - 1;
     let mut pe = vec![0.0f32; pe_len * d];
     for p in 0..pe_len {
-        let pos = p as f32 - (t - 1) as f32;
+        let pos = (t - 1) as f32 - p as f32;
         for i in 0..d / 2 {
             let freq = 1.0 / 10000.0f32.powf(2.0 * i as f32 / d as f32);
             let a = pos * freq;
@@ -340,6 +342,11 @@ impl NemotronEncoder {
             x = layer.forward(&x, &pos, Some(&mask))?;
         }
         Ok(x)
+    }
+
+    /// Полный энкодер, выход [B, T', d_model] (для prompt_kernel/joint).
+    pub fn encode(&self, mel: &Tensor) -> Result<Tensor> {
+        self.forward_through(mel, self.layers.len())
     }
 
     /// Полный энкодер: mel [B,n_mels,T] → encoded [B, d_model, T'] (как NeMo выход, D×T).
