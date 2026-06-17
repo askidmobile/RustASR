@@ -18,3 +18,7 @@ anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+
+[features]
+# Metal zero-copy GGUF загрузка (требует candle metal). Без неё — legacy from_gguf.
+metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]

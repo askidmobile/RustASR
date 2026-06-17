@@ -18,3 +18,6 @@ asr-core = { path = "../asr-core" }
 audio = { path = "../audio" }
 aut-encoder = { path = "../aut-encoder" }
 qwen3-decoder = { path = "../qwen3-decoder" }
+
+[features]
+metal = ["qwen3-decoder/metal"]
