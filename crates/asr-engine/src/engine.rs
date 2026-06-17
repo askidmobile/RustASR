@@ -134,6 +134,20 @@ impl AsrEngine {
                     "Qwen3-ASR не скомпилирован. Включите feature 'qwen3' в asr-engine.".into(),
                 ));
             }
+
+            #[cfg(feature = "nemotron")]
+            ModelType::Nemotron => {
+                // Nemotron сам выбирает GGUF(Q8)→safetensors; флаг quantized игнорируется.
+                let _ = quantized;
+                Box::new(model_nemotron::NemotronModel::load(model_dir, device)?)
+            }
+
+            #[cfg(not(feature = "nemotron"))]
+            ModelType::Nemotron => {
+                return Err(asr_core::AsrError::Model(
+                    "Nemotron не скомпилирован. Включите feature 'nemotron' в asr-engine.".into(),
+                ));
+            }
         };
 
         info!(

@@ -8,12 +8,13 @@ license.workspace = true
 description = "Единый фасад для всех ASR-моделей RustASR (Whisper, GigaAM, Parakeet, Qwen3)"
 
 [features]
-default = ["whisper", "gigaam", "parakeet", "qwen3"]
+default = ["whisper", "gigaam", "parakeet", "qwen3", "nemotron"]
 whisper = ["dep:model-whisper"]
 gigaam = ["dep:model-gigaam"]
 parakeet = ["dep:model-parakeet"]
 qwen3 = ["dep:model-qwen3"]
-all-models = ["whisper", "gigaam", "parakeet", "qwen3"]
+nemotron = ["dep:model-nemotron"]
+all-models = ["whisper", "gigaam", "parakeet", "qwen3", "nemotron"]
 
 [dependencies]
 asr-core.workspace = true
@@ -28,6 +29,7 @@ model-whisper = { workspace = true, optional = true }
 model-gigaam = { workspace = true, optional = true }
 model-parakeet = { workspace = true, optional = true }
 model-qwen3 = { workspace = true, optional = true }
+model-nemotron = { workspace = true, optional = true }
 
 [dev-dependencies]
 hound.workspace = true

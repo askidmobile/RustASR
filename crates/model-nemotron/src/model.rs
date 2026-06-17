@@ -9,7 +9,12 @@ use candle_core::{DType, Device, Result as CandleResult, Tensor};
 use candle_nn::VarBuilder;
 use tracing::info;
 
-use asr_core::{AsrError, AsrResult};
+use std::time::Instant;
+
+use asr_core::{
+    AsrError, AsrModel, AsrResult, ModelInfo, ModelType, QuantizationType, TranscribeOptions,
+    TranscriptionResult,
+};
 
 use crate::config::NemotronConfig;
 use crate::decoder::PredictionNet;
@@ -221,5 +226,58 @@ impl NemotronModel {
             }
         }
         Ok(tokens)
+    }
+}
+
+impl AsrModel for NemotronModel {
+    fn name(&self) -> &str {
+        &self.config.model_name
+    }
+
+    fn model_type(&self) -> ModelType {
+        ModelType::Nemotron
+    }
+
+    fn supported_languages(&self) -> &[&str] {
+        // Мультиязычная (40 локалей); сейчас сконфигурирована на ru-RU prompt.
+        &[]
+    }
+
+    fn model_info(&self) -> ModelInfo {
+        let gguf = self.model_dir.join("model-q8_0.gguf");
+        let (size, quant) = if gguf.exists() {
+            (std::fs::metadata(&gguf).map(|m| m.len()).ok(), QuantizationType::GgufQ8_0)
+        } else {
+            (
+                std::fs::metadata(self.model_dir.join("model.safetensors")).map(|m| m.len()).ok(),
+                QuantizationType::None,
+            )
+        };
+        ModelInfo {
+            model_type: ModelType::Nemotron,
+            display_name: "Nemotron 3.5 ASR (0.6B)".to_string(),
+            parameters: Some(648_000_000),
+            weights_size_bytes: size,
+            quantization: quant,
+            languages: vec!["ru".to_string()],
+            backend: "candle".to_string(),
+        }
+    }
+
+    fn transcribe(
+        &mut self,
+        samples: &[f32],
+        _options: &TranscribeOptions,
+    ) -> AsrResult<TranscriptionResult> {
+        let t0 = Instant::now();
+        let tokens = self
+            .transcribe_tokens(samples)
+            .map_err(|e| AsrError::Model(format!("inference: {e}")))?;
+        let text = self.vocab.decode(&tokens);
+        let dt = t0.elapsed().as_secs_f64();
+        let dur = samples.len() as f64 / self.config.sample_rate as f64;
+        let mut res = TranscriptionResult::new(text, self.name().to_string(), dt, dur);
+        res.language = Some("ru".to_string());
+        Ok(res)
     }
 }

@@ -16,6 +16,8 @@ pub enum ModelType {
     Parakeet,
     /// Alibaba Qwen3-ASR — AuT encoder + Qwen3 LLM decoder.
     Qwen3Asr,
+    /// NVIDIA Nemotron 3.5 ASR — FastConformer-CacheAware-RNNT + Lang prompt.
+    Nemotron,
 }
 
 impl ModelType {
@@ -26,6 +28,7 @@ impl ModelType {
             ModelType::GigaAm,
             ModelType::Parakeet,
             ModelType::Qwen3Asr,
+            ModelType::Nemotron,
         ]
     }
 
@@ -36,6 +39,7 @@ impl ModelType {
             ModelType::GigaAm => "gigaam",
             ModelType::Parakeet => "parakeet",
             ModelType::Qwen3Asr => "qwen3-asr",
+            ModelType::Nemotron => "nemotron",
         }
     }
 
@@ -46,6 +50,7 @@ impl ModelType {
             ModelType::GigaAm => "GigaAM v3 E2E CTC",
             ModelType::Parakeet => "Parakeet TDT v3",
             ModelType::Qwen3Asr => "Qwen3-ASR-0.6B",
+            ModelType::Nemotron => "Nemotron 3.5 ASR (0.6B)",
         }
     }
 
@@ -62,6 +67,7 @@ impl ModelType {
             "gigaam" | "gigaam-ctc" | "gigaam-v3" => Some(ModelType::GigaAm),
             "parakeet" | "parakeet-tdt" | "parakeet-v3" => Some(ModelType::Parakeet),
             "qwen3-asr" | "qwen3" | "qwen" => Some(ModelType::Qwen3Asr),
+            "nemotron" | "nemotron-asr" | "nemotron-3.5-asr-streaming-0.6b" => Some(ModelType::Nemotron),
             _ => None,
         }
     }
