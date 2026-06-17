@@ -29,8 +29,10 @@ pub mod config;
 pub mod encoder;
 pub mod mel;
 pub mod model;
+pub mod prompt;
 
 pub use config::NemotronConfig;
 pub use encoder::NemotronEncoder;
 pub use mel::NemotronMelExtractor;
 pub use model::NemotronModel;
+pub use prompt::PromptKernel;
