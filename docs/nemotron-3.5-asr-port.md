@@ -75,14 +75,24 @@ RNN-T (вместо TDT) greedy, причинная маска энкодера,
         (7) WAV-парсер должен искать data-чанк (не skip-44).
       - Тесты: mel_parity, encoder_subsampling_parity, encoder_layers_parity, prompt_parity,
         config_parse, transcribe_e2e. Скрипт NeMo-дампов: nemotron_reference_and_dump.py.
-- [ ] **Ф4 Квантование:** энкодер safetensors(BF16) + decoder/joint Q8_0 GGUF (RNN-T loop F32);
-      WER Q8 vs F32.
-- [ ] **Ф5 Интеграция Yttri:** path-dep model-nemotron; `EngineType::Nemotron` (engine_manager);
-      `nemotron_engine.rs`; bundled_models; models_downloader; provisioning; mel_common.
-- [ ] **Ф6 S3 + публикация:** залить квант. файлы в S3 (`models/nemotron-3.5-asr-streaming-0.6b/`) +
-      `storage_files`(modelId) + presigned. ⚠️ наружу — подтвердить перед заливкой.
-- [ ] **Ф7 Сравнение:** Nemotron в `asr_ru_real_audio_compare.rs`; прогон всех RU ASR:
-      WER/RTF/RAM/размер.
+- [x] **Ф4 Квантование** ✓ `model-q8_0.gguf` 755МБ (vs 2434МБ F32, 3.2×): rank-2 .weight (не
+      norm) → Q8_0 (223 тензора, энкодер), прочее → F16. `examples/quantize_nemotron.rs`.
+      Загрузка авто-GGUF (dequant→F32 VarBuilder). e2e на Q8 = эталон ТОЧНО (качество сохранено).
+      Остаток Ф4b: QMatMul-путь (Q8 в RAM ~0.9ГБ вместо dequant 2.4ГБ).
+- [~] **Ф5 Интеграция:** RustASR-сторона ✓ — `impl AsrModel for NemotronModel`,
+      `ModelType::Nemotron` (asr-core), feature `nemotron` + dispatch в `asr-engine`.
+      ОСТАЛОСЬ (Yttri-сторона): Cargo path-dep model-nemotron в frontend/src-tauri;
+      `EngineType::Nemotron` в engine_manager.rs (+from_model_id "nemotron"); адаптер
+      `nemotron_engine.rs` (impl TranscriptionEngineTrait, как qwen3_asr_engine);
+      bundled_models.rs (EXPECTED_*, sentinel files model-q8_0.gguf, sizes);
+      models_downloader.rs get_available_models (s3_key); provisioning ALWAYS_DOWNLOAD.
+- [ ] **Ф6 S3 + публикация** ⚠️ наружу — подтвердить перед заливкой. Залить
+      `model-q8_0.gguf`+`config.json`+`vocab.json`+`tokenizer.model` в S3
+      (`models/nemotron-3.5-asr-streaming-0.6b/`) + `storage_files`(metadata.modelId) + presigned.
+- [~] **Ф7 Сравнение:** харнесс `crates/asr-engine/examples/compare_ru.rs` готов (транскрипт+RTF+
+      size+WER vs GigaAM). Прогон 4 моделей (GigaAM/Whisper/Parakeet/Nemotron) — OK, Nemotron RU
+      корректен. **Qwen3 исключён**: `qwen3-decoder` не компилируется против текущего candle-fork
+      (from_gguf_zero_copy/from_gguf_mmap_zero_copy удалены) — ПРЕДСУЩЕСТВУЮЩИЙ баг, не Nemotron.
 
 ## 4b. Эталон Ф1 (NeMo, ru-RU idx 11, att_context [56,13], CPU)
 

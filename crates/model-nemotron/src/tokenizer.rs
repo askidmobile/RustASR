@@ -35,14 +35,32 @@ impl SpVocab {
     }
 
     /// Детокенизация: ▁ → пробел, конкатенация, trim.
+    /// Пропускает language-теги `<xx-XX>` (strip_lang_tags поведение NeMo).
     pub fn decode(&self, tokens: &[u32]) -> String {
         let mut s = String::new();
         for &t in tokens {
             let i = t as usize;
             if i < self.vocab.len() {
-                s.push_str(&self.vocab[i].replace('\u{2581}', " "));
+                let piece = &self.vocab[i];
+                if is_lang_tag(piece) {
+                    continue;
+                }
+                s.push_str(&piece.replace('\u{2581}', " "));
             }
         }
         s.trim().to_string()
     }
+}
+
+/// Язык-тег вида `<ru-RU>` / `<en-US>` (буквы-минус-буквы в угловых скобках).
+fn is_lang_tag(p: &str) -> bool {
+    let b = p.as_bytes();
+    if b.len() < 5 || b[0] != b'<' || b[b.len() - 1] != b'>' {
+        return false;
+    }
+    let inner = &p[1..p.len() - 1];
+    matches!(inner.split_once('-'),
+        Some((a, c)) if !a.is_empty() && !c.is_empty()
+            && a.chars().all(|ch| ch.is_ascii_alphabetic())
+            && c.chars().all(|ch| ch.is_ascii_alphanumeric()))
 }
