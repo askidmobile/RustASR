@@ -89,10 +89,20 @@ RNN-T (вместо TDT) greedy, причинная маска энкодера,
 - [ ] **Ф6 S3 + публикация** ⚠️ наружу — подтвердить перед заливкой. Залить
       `model-q8_0.gguf`+`config.json`+`vocab.json`+`tokenizer.model` в S3
       (`models/nemotron-3.5-asr-streaming-0.6b/`) + `storage_files`(metadata.modelId) + presigned.
-- [~] **Ф7 Сравнение:** харнесс `crates/asr-engine/examples/compare_ru.rs` готов (транскрипт+RTF+
-      size+WER vs GigaAM). Прогон 4 моделей (GigaAM/Whisper/Parakeet/Nemotron) — OK, Nemotron RU
-      корректен. **Qwen3 исключён**: `qwen3-decoder` не компилируется против текущего candle-fork
-      (from_gguf_zero_copy/from_gguf_mmap_zero_copy удалены) — ПРЕДСУЩЕСТВУЮЩИЙ баг, не Nemotron.
+- [x] **Ф7 Сравнение** ✓ `crates/asr-engine/examples/compare_ru.rs` — все 5 моделей на RU.
+      30с разговорный (CPU): GigaAM RTF0.16/884МБ (ref), Whisper 1.51/865МБ, Parakeet 0.24/2508МБ,
+      Qwen3-ASR 0.64/779МБ, **Nemotron 0.28/756МБ**. На чистом/коротком RU Nemotron = NeMo точно;
+      на тяжёлом разговорном — хвостовые ошибки как у NeMo. **Qwen3 включён** после фикса
+      qwen3-decoder (см. ниже).
+
+## 6. Фикс qwen3-decoder (предсуществующий, не Nemotron)
+
+`qwen3-decoder` не компилировался standalone на macOS: zero-copy методы candle-fork
+(`from_gguf_zero_copy`/`from_gguf_mmap_zero_copy`) под `#[cfg(feature="metal")]`, а вызовы — под
+`#[cfg(target_os="macos")]`. Standalone RustASR НЕ включает candle metal (workspace, см. коммент
+Cargo) → методов нет → E0599. Фикс: вызовы под `#[cfg(feature="metal")]` + feature `metal` в цепочке
+qwen3-decoder→asr-pipeline→model-qwen3→asr-engine; Yttri `frontend/src-tauri/Cargo.toml` включает
+`model-qwen3 features=["metal"]` на macOS (сохраняет zero-copy в проде). Verified metal-OFF build.
 
 ## 4b. Эталон Ф1 (NeMo, ru-RU idx 11, att_context [56,13], CPU)
 
