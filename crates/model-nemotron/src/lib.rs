@@ -26,7 +26,9 @@
 //! - [ ] `model`   — сборка + impl AsrModel + parity против tmp/parity/nemotron_*.npy.
 
 pub mod config;
+pub mod mel;
 pub mod model;
 
 pub use config::NemotronConfig;
+pub use mel::NemotronMelExtractor;
 pub use model::NemotronModel;
