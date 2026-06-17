@@ -82,8 +82,25 @@ def main():
         def pk_hook(_m, inp, out):
             captured["prompt_kernel_in"] = inp[0].detach().cpu().numpy()
             captured["prompt_kernel_out"] = out.detach().cpu().numpy()
+        def pre_hook(_m, _inp, out):
+            o = out[0] if isinstance(out, tuple) else out
+            captured["pre_encode_out"] = o.detach().cpu().numpy()
         model.encoder.register_forward_hook(enc_hook)
         model.prompt_kernel.register_forward_hook(pk_hook)
+        # pre_encode (subsampling) output
+        if hasattr(model.encoder, "pre_encode"):
+            model.encoder.pre_encode.register_forward_hook(pre_hook)
+        # выходы первых двух conformer-слоёв
+        try:
+            for li in (0, 1):
+                def mk(idx):
+                    def h(_m, _inp, out):
+                        o = out[0] if isinstance(out, tuple) else out
+                        captured[f"layer{idx}_out"] = o.detach().cpu().numpy()
+                    return h
+                model.encoder.layers[li].register_forward_hook(mk(li))
+        except Exception as e:  # noqa: BLE001
+            print(f"[dump] layer hooks недоступны: {e}")
 
     results = {}
     for path in args.audio:

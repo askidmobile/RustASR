@@ -63,6 +63,21 @@ pub struct EncoderConfig {
     pub pos_emb_max_len: usize,
 }
 
+impl EncoderConfig {
+    /// Размерность одной головы внимания (d_model / n_heads = 1024/8 = 128).
+    pub fn d_k(&self) -> usize {
+        self.d_model / self.n_heads
+    }
+
+    /// Правый/левый контекст внимания для offline (в кадрах энкодера, 80мс).
+    pub fn offline_context(&self) -> (i64, i64) {
+        match self.att_context_for_offline.as_slice() {
+            [l, r] => (*l, *r),
+            _ => (56, 13),
+        }
+    }
+}
+
 /// RNN-T prediction network (embed + 2-layer LSTM).
 #[derive(Debug, Clone, Deserialize)]
 pub struct DecoderConfig {
