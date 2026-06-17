@@ -27,6 +27,48 @@ pub struct TdtResult {
     pub timestamps: Vec<(u32, u64)>,
 }
 
+/// Гипотеза TDT beam-поиска (несёт собственное время из-за длительностей).
+#[derive(Clone)]
+struct TdtBeamHyp {
+    tokens: Vec<u32>,
+    timestamps: Vec<(u32, u64)>,
+    state: crate::decoder::LstmState,
+    pred_out: Tensor,
+    time: usize,
+    symbols_at_t: usize,
+    score: f32,
+}
+
+fn log_softmax_vec(v: &[f32]) -> Vec<f32> {
+    let m = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mut s = 0.0f32;
+    for &x in v {
+        s += (x - m).exp();
+    }
+    let lse = m + s.ln();
+    v.iter().map(|&x| x - lse).collect()
+}
+
+fn argmax(v: &[f32]) -> usize {
+    let mut bi = 0usize;
+    let mut bv = f32::NEG_INFINITY;
+    for (i, &x) in v.iter().enumerate() {
+        if x > bv {
+            bv = x;
+            bi = i;
+        }
+    }
+    bi
+}
+
+/// top-K индексов по убыванию значения, исключая `exclude` (blank).
+fn top_k_indices(v: &[f32], k: usize, exclude: usize) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..v.len()).filter(|&i| i != exclude).collect();
+    idx.sort_by(|&a, &b| v[b].total_cmp(&v[a]));
+    idx.truncate(k);
+    idx
+}
+
 /// TDT greedy decoder.
 pub struct TdtGreedyDecoder {
     durations: Vec<usize>,
@@ -53,6 +95,116 @@ impl TdtGreedyDecoder {
         joint: &JointNetwork,
     ) -> Result<TdtResult> {
         self.decode_inner(encoder_output, prediction_net, joint, None)
+    }
+
+    /// TDT beam-search (token-beam + greedy-duration, per-hyp время).
+    ///
+    /// В отличие от RNN-T, длительность TDT (skip 0..4) рассинхронизирует гипотезы по
+    /// времени, поэтому каждая гипотеза несёт собственный `time`. Расширяем по top-K
+    /// токенам (+ blank), длительность берём argmax (greedy, она не зависит от токена).
+    /// beam_width<=1 эквивалентно greedy.
+    pub fn beam_decode(
+        &self,
+        encoder_output: &Tensor,
+        prediction_net: &PredictionNet,
+        joint: &JointNetwork,
+        beam_width: usize,
+    ) -> Result<TdtResult> {
+        if beam_width <= 1 {
+            return self.decode(encoder_output, prediction_net, joint);
+        }
+        let t_total = encoder_output.dim(0)?;
+        let device = encoder_output.device();
+        let enc_h_all = joint.project_encoder_all(encoder_output)?; // [T, joint_hidden]
+        let blank = self.blank_idx;
+
+        let init_state = prediction_net.initial_state(device)?;
+        let (pred0, state0) = prediction_net.step(blank as u32, &init_state)?;
+        let mut beam = vec![TdtBeamHyp {
+            tokens: Vec::new(),
+            timestamps: Vec::new(),
+            state: state0,
+            pred_out: pred0,
+            time: 0,
+            symbols_at_t: 0,
+            score: 0.0,
+        }];
+        let mut finished: Vec<TdtBeamHyp> = Vec::new();
+
+        // Каждый шаг либо двигает время, либо ограничен max_symbols → терминируется.
+        let max_iters = (t_total + 1) * (self.max_symbols_per_step + 2) * 4 + 64;
+        let mut iters = 0usize;
+        while !beam.is_empty() {
+            iters += 1;
+            if iters > max_iters {
+                debug!("TDT beam: max_iters достигнут");
+                break;
+            }
+            let mut active: Vec<TdtBeamHyp> = Vec::new();
+            for h in beam.drain(..) {
+                if h.time >= t_total {
+                    finished.push(h);
+                } else {
+                    active.push(h);
+                }
+            }
+            if active.is_empty() {
+                break;
+            }
+            let mut cand: Vec<TdtBeamHyp> = Vec::new();
+            for h in &active {
+                let enc_h = enc_h_all.i(h.time)?;
+                let (tok_logits, dur_logits) = joint.forward_with_cached_enc(&enc_h, &h.pred_out)?;
+                let tlog = log_softmax_vec(
+                    &tok_logits.to_dtype(candle_core::DType::F32)?.flatten_all()?.to_vec1::<f32>()?,
+                );
+                let dlog = log_softmax_vec(
+                    &dur_logits.to_dtype(candle_core::DType::F32)?.flatten_all()?.to_vec1::<f32>()?,
+                );
+                let dur_idx = argmax(&dlog);
+                let skip = self.durations.get(dur_idx).copied().unwrap_or(1);
+                let dlp = dlog[dur_idx];
+
+                // blank-ветка: время вперёд на skip(>=1), эмиссии нет
+                let mut nb = h.clone();
+                nb.score += tlog[blank] + dlp;
+                nb.time += skip.max(1);
+                nb.symbols_at_t = 0;
+                cand.push(nb);
+
+                // top-K не-blank токенов
+                for &k in top_k_indices(&tlog, beam_width, blank).iter() {
+                    let (po, sn) = prediction_net.step(k as u32, &h.state)?;
+                    let mut nb = h.clone();
+                    nb.tokens.push(k as u32);
+                    nb.timestamps.push((k as u32, (h.time as u64) * 80));
+                    nb.state = sn;
+                    nb.pred_out = po;
+                    nb.score += tlog[k] + dlp;
+                    if skip == 0 {
+                        nb.symbols_at_t = h.symbols_at_t + 1;
+                        if nb.symbols_at_t >= self.max_symbols_per_step {
+                            nb.time += 1;
+                            nb.symbols_at_t = 0;
+                        }
+                    } else {
+                        nb.time += skip;
+                        nb.symbols_at_t = 0;
+                    }
+                    cand.push(nb);
+                }
+            }
+            cand.sort_by(|a, b| b.score.total_cmp(&a.score));
+            cand.truncate(beam_width);
+            beam = cand;
+        }
+        finished.extend(beam.drain(..));
+        finished.sort_by(|a, b| b.score.total_cmp(&a.score));
+        Ok(finished
+            .into_iter()
+            .next()
+            .map(|h| TdtResult { tokens: h.tokens, timestamps: h.timestamps })
+            .unwrap_or(TdtResult { tokens: Vec::new(), timestamps: Vec::new() }))
     }
 
     /// Streaming TDT декодирование: callback вызывается на каждый non-blank токен.

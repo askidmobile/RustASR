@@ -259,10 +259,19 @@ impl ParakeetModel {
     /// Транскрибация одного чанка аудио.
     fn transcribe_chunk(&self, samples: &[f32]) -> AsrResult<(String, Vec<(u32, u64)>)> {
         let encoder_output = self.encode_chunk(samples)?;
-        let result = self
-            .tdt_decoder
-            .decode(&encoder_output, &self.prediction_net, &self.joint)
-            .map_err(|e| AsrError::Inference(e.to_string()))?;
+        // PARAKEET_BEAM=N (>1) → TDT beam-search; иначе greedy.
+        let beam_width = std::env::var("PARAKEET_BEAM")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(1);
+        let result = if beam_width > 1 {
+            self.tdt_decoder
+                .beam_decode(&encoder_output, &self.prediction_net, &self.joint, beam_width)
+        } else {
+            self.tdt_decoder
+                .decode(&encoder_output, &self.prediction_net, &self.joint)
+        }
+        .map_err(|e| AsrError::Inference(e.to_string()))?;
         let text = self.tokenizer.decode(&result.tokens);
         debug!("Transcript ({}): {}", result.tokens.len(), &text);
         Ok((text, result.timestamps))

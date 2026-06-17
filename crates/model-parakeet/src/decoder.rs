@@ -115,6 +115,7 @@ impl LstmLayer {
 }
 
 /// Состояние LSTM (скрытое состояние и ячейка для каждого слоя).
+#[derive(Clone)]
 pub struct LstmState {
     /// h[i]: [hidden_size] для каждого слоя.
     pub h: Vec<Tensor>,
