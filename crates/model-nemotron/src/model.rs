@@ -50,34 +50,23 @@ fn argmax(v: &[f32]) -> usize {
 }
 
 impl NemotronModel {
-    /// Загрузить модель из директории (config.json + model.safetensors + vocab.json).
+    /// Загрузить модель из директории. Приоритет: `model-q8_0.gguf` (Q8, ~755МБ),
+    /// fallback `model.safetensors` (F32, ~2.4ГБ). + config.json + vocab.json.
     pub fn load(model_dir: impl AsRef<Path>, device: &Device) -> AsrResult<Self> {
         let model_dir = model_dir.as_ref().to_path_buf();
         let config = NemotronConfig::from_json_file(&model_dir.join("config.json"))
             .map_err(|e| AsrError::Config(format!("config.json: {e}")))?;
-        let st = model_dir.join("model.safetensors");
-        if !st.exists() {
-            return Err(AsrError::Model(format!("нет model.safetensors в {model_dir:?}")));
-        }
         let vocab = SpVocab::from_json(&model_dir.join("vocab.json"))
             .map_err(|e| AsrError::Model(format!("vocab.json: {e}")))?;
 
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[st], DType::F32, device)
-                .map_err(|e| AsrError::Model(format!("safetensors: {e}")))?
+        let gguf = model_dir.join("model-q8_0.gguf");
+        let (vb, fb, window) = if gguf.exists() {
+            Self::weights_from_gguf(&gguf, device)?
+        } else {
+            Self::weights_from_safetensors(&model_dir.join("model.safetensors"), device)?
         };
 
-        // mel: fb + window из весов
-        let w = candle_core::safetensors::load(model_dir.join("model.safetensors"), device)
-            .map_err(|e| AsrError::Model(format!("load weights: {e}")))?;
-        let fb = w
-            .get("preprocessor.featurizer.fb")
-            .ok_or_else(|| AsrError::Model("нет preprocessor.featurizer.fb".into()))?;
-        let window = w
-            .get("preprocessor.featurizer.window")
-            .ok_or_else(|| AsrError::Model("нет preprocessor.featurizer.window".into()))?;
-        let mel = NemotronMelExtractor::from_tensors(&config, fb, window)?;
-
+        let mel = NemotronMelExtractor::from_tensors(&config, &fb, &window)?;
         let encoder = NemotronEncoder::load(&config.encoder, vb.pp("encoder"))
             .map_err(|e| AsrError::Model(format!("encoder: {e}")))?;
         let prompt = PromptKernel::load(&config.prompt, vb.pp("prompt_kernel"))
@@ -89,25 +78,64 @@ impl NemotronModel {
 
         let lang_idx = config.prompt.lang_idx("ru-RU").unwrap_or(11);
         let blank_idx = config.decoder.blank_idx as u32;
-
         info!(
-            "Nemotron загружен: encoder {}×{}d, vocab {}, blank {}, ru-RU prompt {}",
+            "Nemotron загружен ({}): encoder {}×{}d, vocab {}, blank {}, ru-RU {}",
+            if gguf.exists() { "Q8 GGUF" } else { "F32 safetensors" },
             config.encoder.n_layers, config.encoder.d_model, config.decoder.vocab_size, blank_idx, lang_idx
         );
 
         Ok(Self {
-            config,
-            device: device.clone(),
-            model_dir,
-            mel,
-            encoder,
-            prompt,
-            pred,
-            joint,
-            vocab,
-            blank_idx,
-            lang_idx,
+            config, device: device.clone(), model_dir,
+            mel, encoder, prompt, pred, joint, vocab, blank_idx, lang_idx,
         })
+    }
+
+    /// VarBuilder + fb/window из F32 safetensors.
+    fn weights_from_safetensors(
+        st: &Path,
+        device: &Device,
+    ) -> AsrResult<(VarBuilder<'static>, Tensor, Tensor)> {
+        if !st.exists() {
+            return Err(AsrError::Model(format!("нет {st:?}")));
+        }
+        let w = candle_core::safetensors::load(st, device)
+            .map_err(|e| AsrError::Model(format!("load weights: {e}")))?;
+        let fb = w.get("preprocessor.featurizer.fb").cloned()
+            .ok_or_else(|| AsrError::Model("нет fb".into()))?;
+        let window = w.get("preprocessor.featurizer.window").cloned()
+            .ok_or_else(|| AsrError::Model("нет window".into()))?;
+        let vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&[st.to_path_buf()], DType::F32, device)
+                .map_err(|e| AsrError::Model(format!("safetensors: {e}")))?
+        };
+        Ok((vb, fb, window))
+    }
+
+    /// VarBuilder + fb/window из Q8 GGUF (все тензоры dequant → F32).
+    /// Корректность важнее RAM (Q8 в RAM через QMatMul — отдельная оптимизация Ф4b).
+    fn weights_from_gguf(
+        path: &Path,
+        device: &Device,
+    ) -> AsrResult<(VarBuilder<'static>, Tensor, Tensor)> {
+        use candle_core::quantized::gguf_file;
+        let mut f = std::fs::File::open(path)
+            .map_err(|e| AsrError::Model(format!("open gguf: {e}")))?;
+        let content = gguf_file::Content::read(&mut f)
+            .map_err(|e| AsrError::Model(format!("read gguf: {e}")))?;
+        let mut map: std::collections::HashMap<String, Tensor> = std::collections::HashMap::new();
+        for name in content.tensor_infos.keys() {
+            let qt = content.tensor(&mut f, name, device)
+                .map_err(|e| AsrError::Model(format!("gguf tensor {name}: {e}")))?;
+            let t = qt.dequantize(device)
+                .map_err(|e| AsrError::Model(format!("dequant {name}: {e}")))?;
+            map.insert(name.clone(), t);
+        }
+        let fb = map.get("preprocessor.featurizer.fb").cloned()
+            .ok_or_else(|| AsrError::Model("нет fb в gguf".into()))?;
+        let window = map.get("preprocessor.featurizer.window").cloned()
+            .ok_or_else(|| AsrError::Model("нет window в gguf".into()))?;
+        let vb = VarBuilder::from_tensors(map, DType::F32, device);
+        Ok((vb, fb, window))
     }
 
     /// Транскрибировать аудио (16kHz mono f32) → текст (язык по lang_idx, ru-RU).
