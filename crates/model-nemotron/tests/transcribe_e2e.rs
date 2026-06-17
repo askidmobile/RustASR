@@ -52,11 +52,20 @@ fn transcribes_russian() {
     }
 
     // golden NeMo (ru-RU): test_prod_3s.wav → "Примерно в двадцать третьем году в двадцать четыре"
+    // Паритет проверяем на GREEDY (бит-в-бит к NeMo greedy). Beam — отдельно (smoke).
     let wav = root.join("test_prod_3s.wav");
     let golden = "Примерно в двадцать третьем году в двадцать четыре";
     let samples = load_wav_i16(&wav);
+
+    unsafe { std::env::set_var("NEMOTRON_BEAM", "1") }; // форсируем greedy
     let text = model.transcribe(&samples).unwrap();
-    println!("RUST : {text:?}");
-    println!("GOLD : {golden:?}");
-    assert_eq!(text.trim(), golden.trim(), "транскрипция должна совпасть с эталоном NeMo");
+    println!("GREEDY: {text:?}");
+    println!("GOLD  : {golden:?}");
+    assert_eq!(text.trim(), golden.trim(), "greedy должен совпасть с эталоном NeMo");
+
+    // beam (дефолт) — smoke: непустой и содержит ключевые слова.
+    unsafe { std::env::remove_var("NEMOTRON_BEAM") };
+    let beam = model.transcribe(&samples).unwrap();
+    println!("BEAM  : {beam:?}");
+    assert!(beam.contains("двадцать") && beam.contains("Примерно"), "beam должен дать связный RU");
 }

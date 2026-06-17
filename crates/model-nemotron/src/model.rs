@@ -27,6 +27,11 @@ use crate::tokenizer::SpVocab;
 /// Максимум символов на один кадр энкодера (RNN-T greedy).
 const MAX_SYMBOLS_PER_STEP: usize = 10;
 
+/// Ширина beam по умолчанию (beam-search RNN-T). 1 = greedy.
+/// Замеры: beam=4 восстанавливает пропущенные слова на трудном RU; >4 — diminishing.
+/// Override: env NEMOTRON_BEAM.
+const DEFAULT_BEAM_WIDTH: usize = 4;
+
 pub struct NemotronModel {
     pub config: NemotronConfig,
     device: Device,
@@ -52,6 +57,26 @@ fn argmax(v: &[f32]) -> usize {
         }
     }
     best
+}
+
+/// log-softmax по вектору логитов (numerically stable).
+fn log_softmax_vec(logits: &[f32]) -> Vec<f32> {
+    let m = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0f32;
+    for &x in logits {
+        sum += (x - m).exp();
+    }
+    let lse = m + sum.ln();
+    logits.iter().map(|&x| x - lse).collect()
+}
+
+/// Гипотеза beam-поиска RNN-T.
+#[derive(Clone)]
+struct BeamHyp {
+    tokens: Vec<u32>,
+    state: crate::decoder::LstmState,
+    g: Tensor,
+    score: f32,
 }
 
 impl NemotronModel {
@@ -167,7 +192,82 @@ impl NemotronModel {
             .map_err(|e| candle_core::Error::Msg(format!("mel: {e}")))?; // [1,128,T]
         let encoded = self.encoder.encode(&mel)?; // [1,T',1024]
         let fused = self.prompt.forward(&encoded, self.lang_idx)?; // [1,T',1024]
-        self.greedy_decode(&fused)
+        // По умолчанию beam-search (ширина DEFAULT_BEAM_WIDTH); env NEMOTRON_BEAM=1 → greedy.
+        let w = std::env::var("NEMOTRON_BEAM")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_BEAM_WIDTH);
+        if w > 1 {
+            self.beam_decode(&fused, w)
+        } else {
+            self.greedy_decode(&fused)
+        }
+    }
+
+    /// RNN-T beam-search (Graves, time-synchronous) по сфьюженному выходу.
+    /// Держит beam_width гипотез; на каждом кадре blank-расширение → след. кадр,
+    /// token-расширения (top-K) остаются в кадре. Скор = сумма log-prob.
+    pub fn beam_decode(&self, fused: &Tensor, beam_width: usize) -> CandleResult<Vec<u32>> {
+        let fused = if fused.dims().len() == 3 { fused.squeeze(0)? } else { fused.clone() };
+        let enc_proj = self.joint.project_enc(&fused)?; // [T,640]
+        let t_frames = enc_proj.dim(0)?;
+        let blank = self.blank_idx as usize;
+
+        let init = self.pred.initial_state(&self.device)?;
+        let (g0, s0) = self.pred.step(self.blank_idx, &init)?;
+        let mut beam = vec![BeamHyp { tokens: vec![], state: s0, g: g0, score: 0.0 }];
+
+        for t in 0..t_frames {
+            let enc_t = enc_proj.narrow(0, t, 1)?.squeeze(0)?; // [640]
+            let mut a = std::mem::take(&mut beam);
+            let mut b: Vec<BeamHyp> = Vec::new();
+            let mut guard = 0usize;
+            let max_expansions = beam_width * (MAX_SYMBOLS_PER_STEP + 1) + 4;
+            while !a.is_empty() && guard < max_expansions {
+                guard += 1;
+                // достать лучшую гипотезу из A
+                let bi = a
+                    .iter()
+                    .enumerate()
+                    .max_by(|x, y| x.1.score.total_cmp(&y.1.score))
+                    .map(|(i, _)| i)
+                    .unwrap();
+                let y = a.swap_remove(bi);
+                let logits = self.joint.step_logits(&enc_t, &y.g)?.to_vec1::<f32>()?;
+                let logp = log_softmax_vec(&logits);
+                // blank → переносим в B (продвинуть время), токены не меняются
+                let mut yb = y.clone();
+                yb.score += logp[blank];
+                b.push(yb);
+                // top-K не-blank токенов → расширяем, остаются в A
+                let mut idx: Vec<usize> = (0..logp.len()).filter(|&i| i != blank).collect();
+                idx.sort_by(|&i, &j| logp[j].total_cmp(&logp[i]));
+                for &k in idx.iter().take(beam_width) {
+                    let (g_new, s_new) = self.pred.step(k as u32, &y.state)?;
+                    let mut tk = y.tokens.clone();
+                    tk.push(k as u32);
+                    a.push(BeamHyp { tokens: tk, state: s_new, g: g_new, score: y.score + logp[k] });
+                }
+                if a.len() > beam_width {
+                    a.sort_by(|x, y| y.score.total_cmp(&x.score));
+                    a.truncate(beam_width);
+                }
+                // ранний выход: лучшая в A уже не попадёт в top-W из B
+                if b.len() >= beam_width {
+                    b.sort_by(|x, y| y.score.total_cmp(&x.score));
+                    let wth = b[beam_width - 1].score;
+                    let amax = a.iter().map(|h| h.score).fold(f32::NEG_INFINITY, f32::max);
+                    if amax <= wth {
+                        break;
+                    }
+                }
+            }
+            b.sort_by(|x, y| y.score.total_cmp(&x.score));
+            b.truncate(beam_width.max(1));
+            beam = b;
+        }
+        beam.sort_by(|x, y| y.score.total_cmp(&x.score));
+        Ok(beam.into_iter().next().map(|h| h.tokens).unwrap_or_default())
     }
 
     /// RNN-T greedy по уже сфьюженному (post-prompt_kernel) выходу [.,T,1024] или [T,1024].

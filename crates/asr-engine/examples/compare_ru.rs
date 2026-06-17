@@ -96,13 +96,19 @@ fn main() {
         args.iter().map(PathBuf::from).collect()
     };
 
-    let models = [
+    let all_models = [
         (ModelType::GigaAm, "gigaam-v3-e2e-ctc"),
         (ModelType::Whisper, "whisper-large-v3-turbo"),
         (ModelType::Parakeet, "parakeet-tdt-0.6b-v3"),
         (ModelType::Qwen3Asr, "qwen3-asr-0.6b"),
         (ModelType::Nemotron, "nemotron-3.5-asr-streaming-0.6b"),
     ];
+    // CMP_ONLY=parakeet,nemotron — прогнать только эти (по as_str). Иначе все.
+    let only = std::env::var("CMP_ONLY").unwrap_or_default();
+    let models: Vec<_> = all_models
+        .into_iter()
+        .filter(|(mt, _)| only.is_empty() || only.split(',').any(|k| mt.as_str().contains(k.trim())))
+        .collect();
 
     println!("device={device:?}\n");
 
