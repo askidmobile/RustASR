@@ -64,8 +64,17 @@ RNN-T (вместо TDT) greedy, причинная маска энкодера,
 - [~] **Ф1 Эталон:** NeMo транскрипция RU-фикстур (golden text) + WER; дамп референс-тензоров
       (mel/encoder/prompt_kernel/joint) для parity Rust-порта.
 - [x] **Ф2 Конвертация:** .nemo → safetensors + config.json + vocab.json + tokenizer.
-- [ ] **Ф3 Rust-порт** `crates/model-nemotron` (адаптация Parakeet): mel → encoder(causal) →
-      prompt_kernel → RNN-T joint+greedy → detok; parity против Ф1 (tol mel<0.05, logits).
+- [x] **Ф3 Rust-порт** `crates/model-nemotron` ✓ ЗАВЕРШЁН, bit-exact vs NeMo:
+      - mel (mean 0.00000), causal subsampling ×8 (0.00006), 24 conformer-слоя +
+        chunked_limited[56,13] + rel-pos PE **убывающая** (0.00000), prompt_kernel (0.000000),
+        RNN-T decoder (LSTM pred + joint + greedy + SPE detok).
+      - **END-TO-END**: «Примерно в двадцать третьем году в двадцать четыре» = эталон NeMo точно.
+      - Грабли: (1) mel-окно центрируется в n_fft; (2) log add-guard; (3) маска кадров ≥floor(n/hop);
+        (4) causal pad (2,1) обоих измерений subsampling; (5) conv-norm=LayerNorm под ключом
+        batch_norm; (6) **rel-pos PE по УБЫВАНИЮ** (NeMo), не возрастанию — иначе rel_shift рассинхрон;
+        (7) WAV-парсер должен искать data-чанк (не skip-44).
+      - Тесты: mel_parity, encoder_subsampling_parity, encoder_layers_parity, prompt_parity,
+        config_parse, transcribe_e2e. Скрипт NeMo-дампов: nemotron_reference_and_dump.py.
 - [ ] **Ф4 Квантование:** энкодер safetensors(BF16) + decoder/joint Q8_0 GGUF (RNN-T loop F32);
       WER Q8 vs F32.
 - [ ] **Ф5 Интеграция Yttri:** path-dep model-nemotron; `EngineType::Nemotron` (engine_manager);
