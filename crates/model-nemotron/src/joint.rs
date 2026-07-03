@@ -39,6 +39,7 @@ impl JointNet {
         let p = self.pred.forward(&g)?; // [1, joint_hidden]
         let h = e.broadcast_add(&p)?.relu()?;
         let out = self.out.forward(&h)?; // [1, output_dim]
-        out.squeeze(0) // [output_dim]
+        // Логиты всегда F32: дальше argmax/log_softmax считаются на CPU в f32.
+        out.squeeze(0)?.to_dtype(candle_core::DType::F32) // [output_dim]
     }
 }

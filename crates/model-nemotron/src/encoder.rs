@@ -10,7 +10,7 @@
 //! Ф3 parity (tmp/parity/nemotron_*.npy): subsampling→pre_encode_out ✓,
 //! layers→layer0_out/layer1_out, full→encoded_pre_prompt.
 
-use candle_core::{Result, Tensor, D};
+use candle_core::{DType, Result, Tensor, D};
 use candle_nn::{Linear, Module, VarBuilder};
 
 use crate::config::EncoderConfig;
@@ -114,7 +114,8 @@ impl FeedForward {
 /// Синусоидальное rel-pos кодирование (Transformer-XL).
 /// NeMo RelPositionalEncoding: позиции УБЫВАЮТ от +(T-1) до -(T-1)
 /// (pos_emb[0]=+(T-1), середина=0). Подтверждено parity к NeMo (dist 5.6e-08).
-fn rel_pos_emb(t: usize, d: usize, device: &candle_core::Device) -> Result<Tensor> {
+/// Считаем в F32, затем приводим к compute-dtype энкодера (sin/cos ∈ [-1,1] — F16 ок).
+fn rel_pos_emb(t: usize, d: usize, device: &candle_core::Device, dtype: DType) -> Result<Tensor> {
     let pe_len = 2 * t - 1;
     let mut pe = vec![0.0f32; pe_len * d];
     for p in 0..pe_len {
@@ -126,7 +127,7 @@ fn rel_pos_emb(t: usize, d: usize, device: &candle_core::Device) -> Result<Tenso
             pe[p * d + 2 * i + 1] = a.cos();
         }
     }
-    Tensor::from_vec(pe, (1, pe_len, d), device)
+    Tensor::from_vec(pe, (1, pe_len, d), device)?.to_dtype(dtype)
 }
 
 /// Rel-pos multi-head attention с pos_bias_u/v + rel_shift + опциональная маска.
@@ -281,7 +282,13 @@ impl ConformerLayer {
 
 /// Аддитивная chunked_limited маска [1,1,T,T]: 0 где разрешено, -inf где нет.
 /// i видит j ⇔ 0 ≤ chunk(i)-chunk(j) ≤ left_chunks, chunk(k)=k/(right+1).
-fn chunk_mask(t: usize, left: i64, right: i64, device: &candle_core::Device) -> Result<Tensor> {
+fn chunk_mask(
+    t: usize,
+    left: i64,
+    right: i64,
+    device: &candle_core::Device,
+    dtype: DType,
+) -> Result<Tensor> {
     let chunk = (right + 1).max(1);
     let left_chunks = if left >= 0 { left / chunk } else { i64::MAX };
     let mut m = vec![0.0f32; t * t];
@@ -296,7 +303,8 @@ fn chunk_mask(t: usize, left: i64, right: i64, device: &candle_core::Device) -> 
             }
         }
     }
-    Tensor::from_vec(m, (1, 1, t, t), device)
+    // -inf сохраняется при приведении к F16/BF16 (в обоих есть бесконечность) → softmax=0.
+    Tensor::from_vec(m, (1, 1, t, t), device)?.to_dtype(dtype)
 }
 
 // ============================================================================
@@ -308,10 +316,13 @@ pub struct NemotronEncoder {
     layers: Vec<ConformerLayer>,
     d_model: usize,
     offline_context: (i64, i64),
+    /// Compute-dtype весов (из vb.dtype()): F16 в проде, F32 в parity-тестах.
+    dtype: DType,
 }
 
 impl NemotronEncoder {
     pub fn load(config: &EncoderConfig, vb: VarBuilder) -> Result<Self> {
+        let dtype = vb.dtype();
         let subsampling = Subsampling::load(config, vb.pp("pre_encode"))?;
         let mut layers = Vec::with_capacity(config.n_layers);
         for i in 0..config.n_layers {
@@ -322,11 +333,14 @@ impl NemotronEncoder {
             layers,
             d_model: config.d_model,
             offline_context: config.offline_context(),
+            dtype,
         })
     }
 
     /// mel [B, n_mels, T] → subsampled [B, T', d_model] (выход pre_encode).
+    /// mel приходит из CPU-экстрактора в F32 — приводим к compute-dtype энкодера.
     pub fn forward_subsampling(&self, mel: &Tensor) -> Result<Tensor> {
+        let mel = mel.to_dtype(self.dtype)?;
         let x = mel.permute((0, 2, 1))?.unsqueeze(1)?;
         self.subsampling.forward(&x)
     }
@@ -335,9 +349,9 @@ impl NemotronEncoder {
     pub fn forward_through(&self, mel: &Tensor, n: usize) -> Result<Tensor> {
         let mut x = self.forward_subsampling(mel)?; // [B,T,D]
         let t = x.dim(1)?;
-        let pos = rel_pos_emb(t, self.d_model, x.device())?;
+        let pos = rel_pos_emb(t, self.d_model, x.device(), self.dtype)?;
         let (l, r) = self.offline_context;
-        let mask = chunk_mask(t, l, r, x.device())?;
+        let mask = chunk_mask(t, l, r, x.device(), self.dtype)?;
         for layer in self.layers.iter().take(n) {
             x = layer.forward(&x, &pos, Some(&mask))?;
         }

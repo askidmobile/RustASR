@@ -39,10 +39,12 @@ impl PromptKernel {
     pub fn forward(&self, encoded: &Tensor, lang_idx: usize) -> Result<Tensor> {
         let (b, t, _d) = encoded.dims3()?;
         let dev = encoded.device();
-        // one-hot [num_prompts], позиция lang_idx = 1
+        // one-hot [num_prompts], позиция lang_idx = 1; dtype = как у encoded (F16 в проде),
+        // иначе Tensor::cat упрётся в dtype-mismatch F32(one-hot) vs F16(encoded).
         let mut oh = vec![0.0f32; self.num_prompts];
         oh[lang_idx] = 1.0;
         let oh = Tensor::from_vec(oh, (1, 1, self.num_prompts), dev)?
+            .to_dtype(encoded.dtype())?
             .broadcast_as((b, t, self.num_prompts))?;
         let fused = Tensor::cat(&[encoded, &oh], 2)?; // [B,T,D+num_prompts]
         let out = self.forward_fused(&fused)?;

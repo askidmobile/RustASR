@@ -45,6 +45,26 @@ pub struct NemotronModel {
     vocab: SpVocab,
     blank_idx: u32,
     lang_idx: usize,
+    /// Compute-dtype весов (F16 в проде). Нужен, чтобы приводить внешне поданный
+    /// `fused` (например, F32-эталон в parity-тесте) к dtype весов перед joint.
+    compute_dtype: DType,
+}
+
+/// Compute-dtype весов Nemotron после dequant. По умолчанию **F16**: вдвое меньше RAM
+/// (~2.4ГБ→~1.2ГБ) практически без потери качества — joint/decoder/prompt в GGUF уже
+/// хранятся как F16 (round-trip F16→dequant F32→F16 бит-в-бит), а encoder Q8→F16
+/// покрывается 10-битной мантиссой F16 с запасом относительно ошибки самого Q8.
+/// Override: env `NEMOTRON_DTYPE=f32|f16|bf16` (диагностика / A-B качества).
+fn resolve_compute_dtype() -> DType {
+    match std::env::var("NEMOTRON_DTYPE").ok().as_deref() {
+        Some("f32") => DType::F32,
+        Some("bf16") => DType::BF16,
+        None | Some("f16") | Some("") => DType::F16,
+        Some(other) => {
+            tracing::warn!("NEMOTRON_DTYPE='{other}' не распознан — использую f16");
+            DType::F16
+        }
+    }
 }
 
 fn argmax(v: &[f32]) -> usize {
@@ -91,11 +111,15 @@ impl NemotronModel {
 
         // NEMOTRON_FORCE_F32 / NEMOTRON_GGUF=<file> — для диагностики качества квантования.
         let force_f32 = std::env::var("NEMOTRON_FORCE_F32").is_ok();
+        // Compute-dtype весов из GGUF: F16 по умолчанию (вдвое меньше RAM). Полный F32
+        // остаётся через NEMOTRON_FORCE_F32 (safetensors-путь) или NEMOTRON_DTYPE=f32.
+        let compute_dtype = if force_f32 { DType::F32 } else { resolve_compute_dtype() };
         let gguf_name = std::env::var("NEMOTRON_GGUF").unwrap_or_else(|_| "model-q8_0.gguf".into());
         let gguf = model_dir.join(&gguf_name);
         let (vb, fb, window) = if !force_f32 && gguf.exists() {
-            Self::weights_from_gguf(&gguf, device)?
+            Self::weights_from_gguf(&gguf, device, compute_dtype)?
         } else {
+            // Fallback F32 safetensors (диагностика/отсутствие GGUF) — всегда полный F32.
             Self::weights_from_safetensors(&model_dir.join("model.safetensors"), device)?
         };
 
@@ -112,14 +136,16 @@ impl NemotronModel {
         let lang_idx = config.prompt.lang_idx("ru-RU").unwrap_or(11);
         let blank_idx = config.decoder.blank_idx as u32;
         info!(
-            "Nemotron загружен ({}): encoder {}×{}d, vocab {}, blank {}, ru-RU {}",
-            if gguf.exists() { "Q8 GGUF" } else { "F32 safetensors" },
+            "Nemotron загружен ({}, compute={:?}): encoder {}×{}d, vocab {}, blank {}, ru-RU {}",
+            if !force_f32 && gguf.exists() { "Q8 GGUF" } else { "F32 safetensors" },
+            compute_dtype,
             config.encoder.n_layers, config.encoder.d_model, config.decoder.vocab_size, blank_idx, lang_idx
         );
 
         Ok(Self {
             config, device: device.clone(), model_dir,
             mel, encoder, prompt, pred, joint, vocab, blank_idx, lang_idx,
+            compute_dtype,
         })
     }
 
@@ -144,30 +170,53 @@ impl NemotronModel {
         Ok((vb, fb, window))
     }
 
-    /// VarBuilder + fb/window из Q8 GGUF (все тензоры dequant → F32).
-    /// Корректность важнее RAM (Q8 в RAM через QMatMul — отдельная оптимизация Ф4b).
+    /// VarBuilder + fb/window из Q8 GGUF. Веса dequant → `dtype` (F16 по умолчанию —
+    /// вдвое меньше RAM). Исключение: `fb`/`window` всегда остаются F32, т.к. идут в
+    /// CPU-mel (rustfft) и определяют точность мел-фильтрбанка/окна — их понижать нельзя.
+    ///
+    /// **Dequant идёт на CPU, на устройство переносится только финальный (F16) тензор.**
+    /// Иначе на Metal `dequantize`→F32 создаёт крупные временные буферы, которые
+    /// pool-аллокатор candle (round-up до pow2, «первый подходящий ≥ size») затем
+    /// переиспользует под F16-результат — F16-веса оседают в F32-размерных буферах, и
+    /// экономия RAM почти обнуляется (замер: 2024 МБ вместо 1233). CPU-путь держит на
+    /// устройстве ровно один буфер нужного размера на тензор.
     fn weights_from_gguf(
         path: &Path,
         device: &Device,
+        dtype: DType,
     ) -> AsrResult<(VarBuilder<'static>, Tensor, Tensor)> {
         use candle_core::quantized::gguf_file;
+        let cpu = Device::Cpu;
         let mut f = std::fs::File::open(path)
             .map_err(|e| AsrError::Model(format!("open gguf: {e}")))?;
         let content = gguf_file::Content::read(&mut f)
             .map_err(|e| AsrError::Model(format!("read gguf: {e}")))?;
         let mut map: std::collections::HashMap<String, Tensor> = std::collections::HashMap::new();
         for name in content.tensor_infos.keys() {
-            let qt = content.tensor(&mut f, name, device)
+            // Читаем и dequant-им на CPU: крупные F32-временные не попадают в Metal-пул.
+            let qt = content.tensor(&mut f, name, &cpu)
                 .map_err(|e| AsrError::Model(format!("gguf tensor {name}: {e}")))?;
-            let t = qt.dequantize(device)
+            let dq = qt.dequantize(&cpu)
                 .map_err(|e| AsrError::Model(format!("dequant {name}: {e}")))?;
+            let keep_f32 = name == "preprocessor.featurizer.fb"
+                || name == "preprocessor.featurizer.window";
+            let host = if keep_f32 || dtype == DType::F32 {
+                dq
+            } else {
+                dq.to_dtype(dtype)
+                    .map_err(|e| AsrError::Model(format!("cast {name}→{dtype:?}: {e}")))?
+            };
+            // На устройство переносим уже узкий (F16) тензор — один буфер нужного размера.
+            let t = host.to_device(device)
+                .map_err(|e| AsrError::Model(format!("to_device {name}: {e}")))?;
             map.insert(name.clone(), t);
         }
         let fb = map.get("preprocessor.featurizer.fb").cloned()
             .ok_or_else(|| AsrError::Model("нет fb в gguf".into()))?;
         let window = map.get("preprocessor.featurizer.window").cloned()
             .ok_or_else(|| AsrError::Model("нет window в gguf".into()))?;
-        let vb = VarBuilder::from_tensors(map, DType::F32, device);
+        // dtype VarBuilder = compute-dtype: encoder/decoder читают его через vb.dtype().
+        let vb = VarBuilder::from_tensors(map, dtype, device);
         Ok((vb, fb, window))
     }
 
@@ -226,6 +275,8 @@ impl NemotronModel {
     /// token-расширения (top-K) остаются в кадре. Скор = сумма log-prob.
     pub fn beam_decode(&self, fused: &Tensor, beam_width: usize) -> CandleResult<Vec<u32>> {
         let fused = if fused.dims().len() == 3 { fused.squeeze(0)? } else { fused.clone() };
+        // Внешне поданный fused (parity-тест) может быть F32 — приводим к dtype весов.
+        let fused = fused.to_dtype(self.compute_dtype)?;
         let enc_proj = self.joint.project_enc(&fused)?; // [T,640]
         let t_frames = enc_proj.dim(0)?;
         let blank = self.blank_idx as usize;
@@ -291,6 +342,8 @@ impl NemotronModel {
     /// Тест может подать эталонный fused (prompt_kernel_out) для изоляции joint/greedy.
     pub fn greedy_decode(&self, fused: &Tensor) -> CandleResult<Vec<u32>> {
         let fused = if fused.dims().len() == 3 { fused.squeeze(0)? } else { fused.clone() }; // [T',1024]
+        // Внешне поданный fused (parity-тест изоляции) может быть F32 — приводим к dtype весов.
+        let fused = fused.to_dtype(self.compute_dtype)?;
         let enc_proj = self.joint.project_enc(&fused)?; // [T',640]
         let t_frames = enc_proj.dim(0)?;
 
@@ -302,7 +355,7 @@ impl NemotronModel {
         let dbg = std::env::var("NEMOTRON_DEBUG").is_ok();
         if dbg {
             let fstat = |t: &Tensor| -> String {
-                let v = t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                let v = t.flatten_all().unwrap().to_dtype(DType::F32).unwrap().to_vec1::<f32>().unwrap();
                 let n = v.len() as f32;
                 let mean = v.iter().sum::<f32>() / n;
                 let (mn, mx) = v.iter().fold((f32::MAX, f32::MIN), |(a, b), &x| (a.min(x), b.max(x)));

@@ -61,12 +61,14 @@ pub struct LstmState {
 }
 
 impl LstmState {
-    pub fn zeros(num_layers: usize, hidden: usize, device: &Device) -> Result<Self> {
+    /// Нулевое состояние в `dtype` весов (F16 в проде) — иначе matmul в LSTM-шаге
+    /// упрётся в dtype-mismatch state(F32) × weight(F16).
+    pub fn zeros(num_layers: usize, hidden: usize, device: &Device, dtype: DType) -> Result<Self> {
         let mut h = Vec::with_capacity(num_layers);
         let mut c = Vec::with_capacity(num_layers);
         for _ in 0..num_layers {
-            h.push(Tensor::zeros(hidden, DType::F32, device)?);
-            c.push(Tensor::zeros(hidden, DType::F32, device)?);
+            h.push(Tensor::zeros(hidden, dtype, device)?);
+            c.push(Tensor::zeros(hidden, dtype, device)?);
         }
         Ok(Self { h, c })
     }
@@ -77,10 +79,13 @@ pub struct PredictionNet {
     lstm: Vec<LstmLayer>,
     hidden_size: usize,
     num_layers: usize,
+    /// Compute-dtype весов (из vb.dtype()) — для инициализации LSTM-состояния.
+    dtype: DType,
 }
 
 impl PredictionNet {
     pub fn load(config: &DecoderConfig, vb: VarBuilder) -> Result<Self> {
+        let dtype = vb.dtype();
         let pred = vb.pp("prediction");
         let embedding = pred.get((config.embed_rows, config.pred_hidden), "embed.weight")?;
         let lstm_vb = pred.pp("dec_rnn").pp("lstm");
@@ -94,11 +99,12 @@ impl PredictionNet {
             lstm,
             hidden_size: config.pred_hidden,
             num_layers: config.pred_rnn_layers,
+            dtype,
         })
     }
 
     pub fn initial_state(&self, device: &Device) -> Result<LstmState> {
-        LstmState::zeros(self.num_layers, self.hidden_size, device)
+        LstmState::zeros(self.num_layers, self.hidden_size, device, self.dtype)
     }
 
     /// token_id → (pred_out [hidden], new_state). blank → embedding row (padding_idx, нули).
